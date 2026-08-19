@@ -29,12 +29,39 @@
  *      곧바로 지연이다.                    [실측: 4000토큰 73초 / 672토큰 13.7초]
  * ──────────────────────────────────────────────────────────────────── */
 
+/**
+ * @typedef {object} Usage  상류 LLM 응답의 usage 를 그대로 통과시킨 것.
+ *   우리가 만드는 형태가 아니라 상류가 주는 형태다 — 래핑하거나 이름을 바꾸지 않는다.
+ * @property {number} [prompt_tokens]
+ * @property {number} [completion_tokens]  가시 출력 + reasoning 의 합계
+ * @property {object} [completion_tokens_details]
+ * @property {number} [completion_tokens_details.reasoning_tokens]
+ *
+ * W9 의 "출력 토큰"이 무엇으로 이루어졌는지를 가르는 값이 reasoning_tokens 다.
+ * Phase 0 산술로는 48조각 4000토큰 중 약 2250(56%)이 reasoning 으로 추정되나
+ * 확인된 적이 없다. 청크 크기를 정하려면 reasoning 이 요청 크기에 비례하는지
+ * 요청당 고정인지를 알아야 하고, 그 답이 이 필드에만 들어 있다.
+ *
+ * ★ 미확인: CLIProxyAPI 가 usage 를 실제로 전달하는지, reasoning_tokens 를
+ *   채워 주는지 확인된 바 없다. 비어 있으면 Phase 4 측정 1 은 성립하지 않으며
+ *   다른 관측 수단을 찾아야 한다.
+ */
+
 // 불변식 W8: GPT 계열만. Claude 계열로 바꾸면 프록시가 Claude Code 세션으로 라우팅해
 //   시스템 프롬프트를 무시한다 (Phase 4 실측: 1.5초 만에 "I'm Claude Code" 응답).
+// TODO(phase6): Phase 4 측정 3(모델 스윕) 결과로 확정한다. 미측정 후보는
+//   gpt-5.6-terra / gpt-5.5 / gpt-5.4. gpt-5.3-codex-spark 는 48조각에서 10줄만
+//   반환해 탈락했지만, 청크가 12조각으로 줄면 커버리지 과제가 4배 쉬워지므로
+//   재프로브 대상이다(36초 → 약 9초 가능성). 바꿀 때는 반드시 커버리지(모든
+//   조각이 덮이는가)를 함께 확인한다 — 빠른데 틀린 모델이 이미 하나 있었다.
 const LLM_MODEL = "gpt-5.6-luna";
 const DEFAULT_LLM_URL = "https://api.openai.com/v1/chat/completions";
 // Phase 4 실측으로 조정 폐기: low=73/77s, none=70/69s, minimal=49/100s(분산만 커짐).
 //   효과 4% 라 품질 위험을 감수할 이유가 없다. 지연은 REASONING 이 아니라 출력 토큰이 만든다(W9).
+// TODO(phase6): Phase 4 측정 2 로 재판정한다. 위 "4% 차이" 결론은 출력 4000토큰
+//   에서 잰 값이다. 그중 약 2250(56%)이 reasoning 으로 추정되는데, 청크를 줄여
+//   가시 출력이 1/4 이 되면 reasoning 의 비중이 커져 같은 4% 가 아닐 수 있다.
+//   즉 이 상수는 "이미 결론 난 항목"이 아니라 새 영역에서 다시 재야 하는 항목이다.
 const REASONING = "low";     // 번역은 추론이 거의 필요 없음. none 도 가능
 // TODO(phase6): 이 값을 Phase 4 측정 0 에서 나온 LLM 왕복 실측치의 3~4배로 다시 정한다.
 //   90000 은 측정 전에 임의로 넣은 값이라 근거가 없다.
@@ -99,6 +126,13 @@ async function sha1(str) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ── 번역 ─────────────────────────────────────────────────────────────
+/**
+ * 목표 계약 (Phase 6 에서 구현). 지금 코드는 usage 를 반환하지 않는다.
+ * 매개변수는 하나도 바뀌지 않는다 — 반환값만 usage 를 하나 더 싣는다.
+ * @returns {Promise<{lines: object[], degraded?: boolean, usage?: Usage}>}
+ *   usage 는 상류 응답의 것을 그대로 통과시킨다. 상류가 안 주면 필드 자체가 없다
+ *   (0 으로 채우지 않는다 — "측정 안 됨"과 "0 토큰"은 다른 사실이다).
+ */
 async function translateBatch(env, batch, target, ctxB = [], ctxA = []) {
   const payload =
     ctxB.map((t) => `CTX-: ${t}`).join("\n") +
@@ -134,6 +168,11 @@ async function translateBatch(env, batch, target, ctxB = [], ctxA = []) {
       }
       if (!res.ok) throw new Error(`llm ${res.status}`);
 
+      // TODO(phase6): data.usage 를 여기서 붙잡아 아래 두 return 으로 실어 보낸다.
+      //   지금은 통째로 버려지고 있어 reasoning 대 가시 출력의 비율을 알 수 없다 — 그
+      //   비율이 청크 크기를 정하는 유일한 근거다(W9). 경로는 중첩이다:
+      //   data.usage.completion_tokens_details.reasoning_tokens. 평평한 자리를 읽으면
+      //   조용히 undefined 가 나오고 측정이 되는 것처럼 보이면서 전부 0 이 된다.
       const data = await res.json();
       const parsed = JSON.parse(data.choices[0].message.content);
       const out = [];
@@ -170,6 +209,7 @@ async function translateBatch(env, batch, target, ctxB = [], ctxA = []) {
         }
         i = j + 1;
       }
+      // TODO(phase6): 성공 경로. 위에서 붙잡은 usage 를 함께 반환한다.
       if (out.length) return { lines: out.map(({ s, e, ...rest }) => rest) };
     } catch {
       if (attempt === 2) break;
@@ -178,6 +218,9 @@ async function translateBatch(env, batch, target, ctxB = [], ctxA = []) {
   }
 
   // 포기 - 원문만 살려 진행. 전체가 날아가지 않게.
+  // TODO(phase6): 실패 경로에도 usage 를 싣는다. 3회 시도 중 일부가 응답은 했지만
+  //   파싱에 실패했을 수 있고, 그 토큰도 실제로 소모된 시간이다. 아무 응답도 못 받았으면
+  //   필드를 생략한다 — 0 으로 채우면 "측정 안 됨"과 "0 토큰"이 뭉개진다.
   return {
     lines: batch.map((s) => ({ start: s.start, end: s.end, orig: s.text, trans: "" })),
     degraded: true,
@@ -343,6 +386,13 @@ async function enforceShortLines(env, lines) {
   return out;
 }
 
+/**
+ * 목표 계약 (Phase 6 에서 구현).
+ * @returns {Promise<{lines: object[], degraded: number, usage?: Usage}>}
+ *   usage 는 배치별 값의 합이다. W3 대로 확장이 BATCH 보다 작게 보내는 한
+ *   배치는 항상 1개라 합산은 그대로 통과와 같다. 배치가 여럿일 때 합이 옳은
+ *   이유는 이 값이 "요청 하나가 쓴 토큰"을 뜻하기 때문이다.
+ */
 async function translateAll(env, segments, target, ctxB = [], ctxA = []) {
   const batches = [];
   for (let i = 0; i < segments.length; i += BATCH) {
@@ -361,6 +411,7 @@ async function translateAll(env, segments, target, ctxB = [], ctxA = []) {
         my === 0 ? ctxB : [],
         my === batches.length - 1 ? ctxA : []
       );
+      // TODO(phase6): r.usage 를 누산한다. 배치가 여럿일 때 합이 "이 요청이 쓴 토큰"이다.
       if (r.degraded) degraded++;
       results[my] = r.lines;
     }
@@ -370,9 +421,16 @@ async function translateAll(env, segments, target, ctxB = [], ctxA = []) {
     Array.from({ length: Math.min(CONCURRENCY, batches.length) }, runner)
   );
 
+  // TODO(phase6): 누산한 usage 를 반환에 포함한다.
   return { lines: results.flat().sort((a, b) => a.start - b.start), degraded };
 }
 
+/**
+ * 목표 계약 (Phase 6 에서 구현). 요청 본문은 바뀌지 않는다.
+ * 응답에 usage 가 추가된다: { lines, cached, degraded, usage? }
+ *   캐시 히트({ lines, cached: true })에는 usage 가 없다 — LLM 을 안 불렀으므로
+ *   0 이 아니라 "해당 없음"이다. 확장은 이 둘을 구분해야 한다.
+ */
 async function handleSubtitle(request, env, ctx) {
   let body;
   try { body = await request.json(); } catch { return json({ error: "invalid json" }, 400); }
@@ -391,6 +449,10 @@ async function handleSubtitle(request, env, ctx) {
   const fingerprint = await sha1(
     [...ctxB, "\u0002", ...segments.map((s) => s.text), "\u0002", ...ctxA].join("\u0001")
   );
+  // TODO(phase6): 조건부 v7 승격. 청크 크기 변경만으로는 올릴 필요가 없다 — 조각 묶음이
+  //   달라지면 지문이 저절로 달라져 기존 항목은 자연히 빗나간다. 하지만 LLM_MODEL 이나
+  //   REASONING 을 바꾸면 같은 키에 옛 모델의 번역이 남아 계속 서빙되므로 반드시 올린다(W2).
+  //   즉 위 두 상수를 건드렸을 때만 v7 로 올린다.
   const key = `sub:v6:${videoId}:${lang}:${target}:${fingerprint.slice(0, 12)}`;  // v6: 기계 분할, 85자 (W2)
 
   // 불변식 W2: 위 키의 버전(sub:vN)은 출력 줄 형태가 바뀔 때마다 올려야 한다.
@@ -409,6 +471,7 @@ async function handleSubtitle(request, env, ctx) {
       text: s.text.trim().slice(0, 400),
     }));
 
+  // TODO(phase6): translateAll 결과에서 usage 도 함께 받는다.
   let { lines, degraded } = await translateAll(env, clean, target, ctxB, ctxA);
   lines = await enforceShortLines(env, lines);   // 캐시에도 분할된 형태로 저장된다
   if (!lines.length) return json({ error: "번역 실패" }, 502);
@@ -416,6 +479,8 @@ async function handleSubtitle(request, env, ctx) {
   // 일부라도 실패했으면 캐시하지 않는다 (다음에 온전히 재시도)
   if (env.SUBS && !degraded) ctx.waitUntil(env.SUBS.put(key, JSON.stringify(lines)));
 
+  // TODO(phase6): 응답에 usage 를 싣는다. 위 캐시 히트 return 에는 싣지 않는다 —
+  //   LLM 을 안 불렀으므로 0 이 아니라 "해당 없음"이고, 확장은 이 둘을 구분해야 한다.
   return json({ lines, cached: false, degraded: degraded > 0 });
 }
 

@@ -98,6 +98,14 @@ const DEFAULTS = {
  * @property {number}   tFirstPaint  원문 자막이 화면에 처음 뜨기까지
  * @property {number}   tFirstTrans  번역 자막이 화면에 처음 뜨기까지
  * @property {number[]} chunkMs      청크별 왕복 시간
+ * @property {number}   segsPerChunk 이번 세션이 실제로 쓴 청크 크기(조각 수).
+ *                                   지연 수치를 크기와 함께 남겨야 서로 다른 실행끼리
+ *                                   비교가 된다. 이게 없으면 Phase 4 스윕 결과가
+ *                                   "어떤 크기에서 잰 값인지" 알 수 없는 숫자가 된다.
+ * @property {number[]} tokens       청크별 출력 토큰 수(reasoning 포함).
+ *                                   chunkMs 와 같은 인덱스로 정렬된다 — i번째 왕복의
+ *                                   토큰 수가 tokens[i] 다. 워커가 usage 를 안 실어
+ *                                   보내면 0 이 들어간다.
  */
 
 let cfg = { ...DEFAULTS };
@@ -118,7 +126,10 @@ let state = {
    *  stop() 에서 null 이 되므로 runner 는 이 필드를 직접 읽지 말고 지역 캡처본을 쓴다 (I8) */
   abort: null,
   /** @type {Perf} */
-  perf: { t0: 0, tPlayer: 0, tSegs: 0, tFirstPaint: 0, tFirstTrans: 0, chunkMs: [] },
+  perf: {
+    t0: 0, tPlayer: 0, tSegs: 0, tFirstPaint: 0, tFirstTrans: 0,
+    chunkMs: [], segsPerChunk: 0, tokens: [],
+  },
 };
 
 const $ = (s, r = document) => r.querySelector(s);
@@ -260,6 +271,13 @@ async function scrapeTranscriptPanel() {
  *  I12  타임아웃 값 > 워커 최대 소요. Phase 4 실측 LLM 왕복 70~100초 기준으로
  *       워커가 3회까지 쓰면 210~300초이므로 그보다 커야 한다.
  *  I8   signal 은 호출자가 지역 캡처한 것을 받는다. state.abort 를 직접 읽지 않는다. */
+/**
+ * 목표 계약 (Phase 6 에서 구현). 지금은 Line[] 만 반환한다.
+ * 매개변수는 바뀌지 않는다. 반환이 배열에서 객체로 바뀌므로 호출부 1곳도 함께 바뀐다.
+ * @returns {Promise<{lines: Line[], usage?: Usage}>}
+ *   usage 를 이 경로로 끌어올리지 않으면 Phase 4 의 토큰 측정이 불가능하다.
+ *   응답 본문은 이 함수 안에서 소비되므로 호출부가 따로 읽을 방법이 없다.
+ */
 async function requestTranslation(videoId, lang, segments, ctx = {}, signal = null) {
   // TODO(phase6): 요청 1회의 타임아웃을 건다. 내부에 AbortController 를 만들고 전달받은
   //   signal 의 "abort" 이벤트를 addEventListener 로 수동 연결한다. AbortSignal.any() 는
@@ -284,6 +302,9 @@ async function requestTranslation(videoId, lang, segments, ctx = {}, signal = nu
         const detail = await res.text().catch(() => "");
         throw new Error(`서버 ${res.status} ${detail.slice(0, 120)}`);
       }
+      // TODO(phase6): 응답에서 usage 도 꺼내 { lines, usage } 로 반환한다. 반환 형태가
+      //   배열에서 객체로 바뀌므로 호출부 1곳(runner)도 함께 고쳐야 한다 — 안 고치면
+      //   mergeTranslated 에 객체가 들어가 자막이 통째로 사라진다.
       const { lines } = await res.json();
       if (!Array.isArray(lines) || !lines.length) throw new Error("빈 응답");
       return lines;
@@ -720,6 +741,8 @@ async function start() {
   const myGen = ++state.gen;                  // I6
   state.abort = new AbortController();
   const sig = state.abort.signal;             // I8: 지역 캡처 (stop() 이 state.abort 를 비운다)
+  // TODO(phase6): segsPerChunk 와 tokens 를 여기에도 넣는다. Phase 1 에서 최상위 리터럴에만
+  //   추가해 이 재초기화와 형태가 어긋나 있다 — 지금 실행하면 두 필드는 undefined 다.
   state.perf = { t0: performance.now(), tPlayer: 0, tSegs: 0, tFirstPaint: 0, tFirstTrans: 0, chunkMs: [] };
   syncBar();
 
@@ -755,6 +778,11 @@ async function start() {
     // 긴 자막을 한 요청으로 보내면 응답까지 몇 분씩 걸려 연결이 끊긴다.
     // 작은 청크로 나눠, "지금 보고 있는 지점" 주변부터 우선 번역해 바로 띄우고
     // 나머지는 백그라운드로 채운다. 이웃 세그먼트는 문맥(CTX)으로 함께 보낸다.
+    // TODO(phase6): Phase 4 스윕(8/12/24/48)의 결과값으로 확정하고, 그 값을
+    //   state.perf.segsPerChunk 에 기록한다. 크기를 안 남기면 로그의 지연 수치가
+    //   어느 크기에서 나온 것인지 알 수 없어 실행끼리 비교가 안 된다.
+    //   ★ 측정 1 에서 reasoning 이 "요청당 고정"으로 나오면 작게 쪼개도 이득이
+    //   거의 없다 — 그때는 이 값을 바꾸지 말고 Phase 0 으로 되돌아간다.
     const TRANSLATE_CHUNK = 48;
     const CTX_N = 8;
     const chunks = [];
@@ -789,6 +817,11 @@ async function start() {
         pending.delete(c);
         const tReq = performance.now();
         try {
+          // TODO(phase6): { lines, usage } 로 구조분해하고, chunkMs.push 바로 옆에서
+          //   tokens 에도 같은 인덱스로 넣는다. 두 배열의 인덱스가 어긋나면 "이 지연이
+          //   이 토큰 수에서 나왔다"는 대응이 깨져 측정 전체가 무의미해진다.
+          //   usage 가 없는 청크(캐시 히트 등)는 0 이 아니라 null 을 넣는다 — Phase 1
+          //   typedef 의 "없으면 0" 서술도 함께 고친다.
           const lines = await requestTranslation(videoId, track.languageCode, c.segs, {
             before: segments.slice(Math.max(0, c.i0 - CTX_N), c.i0).map((s) => s.text),
             after: segments.slice(c.i0 + c.segs.length, c.i0 + c.segs.length + CTX_N).map((s) => s.text),
@@ -807,6 +840,9 @@ async function start() {
       }
     };
     // Phase 4 실측: 업스트림은 동시 8까지 거의 선형 (1개 73s / 4개 69s / 8개 84s, 실패 0). I13
+    // TODO(phase6): 청크 크기를 줄이면 청크 개수가 그만큼 늘어 8 이 처음으로 실제
+    //   병목이 된다(12분 영상 3개 → 12개, 1시간 15개 → 59개). 8-way 는 실측됐지만
+    //   총 요청 수가 4배로 늘 때의 429 는 미측정이다. Phase 4 측정 결과를 보고 정한다.
     const RUNNERS = 8;
     await Promise.all(Array.from({ length: RUNNERS }, runner));
     if (state.gen !== myGen || !state.active) return;   // I6
@@ -817,6 +853,8 @@ async function start() {
       tPlayer: Math.round(p.tPlayer), tSegs: Math.round(p.tSegs),
       tFirstPaint: Math.round(p.tFirstPaint), tFirstTrans: Math.round(p.tFirstTrans),
       chunkMedian: p.chunkMs.slice().sort((a, b) => a - b)[p.chunkMs.length >> 1],
+      // TODO(phase6): segsPerChunk 와 토큰 통계(중앙값, reasoning 비중)를 함께 찍는다.
+      //   이 로그가 Phase 4 스윕의 유일한 관측창이라 크기와 토큰이 없으면 비교가 안 된다.
       tAllDone: Math.round(performance.now() - p.t0), chunks: chunks.length, failed,
     });
   } catch (e) {
