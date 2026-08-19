@@ -13,6 +13,10 @@
 
   "permissions": ["storage"],
 
+  "background": {
+    "scripts": ["background.js"]
+  },
+
   "host_permissions": [
     "https://www.youtube.com/*",
     "https://sub.example.workers.dev/*",

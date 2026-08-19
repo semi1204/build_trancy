@@ -12,7 +12,16 @@
 
 const LLM_MODEL = "gpt-5.6-luna";
 const DEFAULT_LLM_URL = "https://api.openai.com/v1/chat/completions";
+// TODO(phase6): REASONING 을 "none"(또는 최소값)으로 낮춘다. 추론 모델의 사고 토큰이 응답
+//   지연의 큰 몫을 차지한다. 다만 번역 품질이 함께 떨어질 수 있으므로 Phase 4 육안 확인에서
+//   나빠지면 이 항목만 단독으로 되돌린다.
 const REASONING = "low";     // 번역은 추론이 거의 필요 없음. none 도 가능
+// TODO(phase6): 이 값을 Phase 4 측정 0 에서 나온 LLM 왕복 실측치의 3~4배로 다시 정한다.
+//   90000 은 측정 전에 임의로 넣은 값이라 근거가 없다.
+const LLM_TIMEOUT_MS = 90000;  // LLM 호출 1회의 상한. 멈춘 업스트림이 슬롯을 영구 점유하지 못하게 한다
+// TODO(phase6): BATCH/CONCURRENCY 가 현재 죽은 코드임을 주석으로 명시한다. 확장이 48줄씩
+//   보내므로 배치는 항상 1개이고 내부 동시성 runner 는 한 번도 2개 이상 돈 적이 없다.
+//   값은 바꾸지 않는다 — 실제 동시성 손잡이는 확장의 runner 개수뿐이다.
 const BATCH = 200;           // 컨텍스트 1.05M 이라 넉넉히. 문맥이 클수록 번역 품질↑
 const CONCURRENCY = 3;
 const MAX_SEGMENTS = 8000;
@@ -77,6 +86,9 @@ async function translateBatch(env, batch, target, ctxB = [], ctxA = []) {
     batch.map((s, i) => `${i}: ${s.text}`).join("\n") +
     (ctxA.length ? "\n" + ctxA.map((t) => `CTX+: ${t}`).join("\n") : "");
 
+  // TODO(phase6): 아래 fetch 에 AbortController + LLM_TIMEOUT_MS 를 건다. 지금은 타임아웃이
+  //   없어 업스트림이 멈추면 요청이 무기한 매달리고, 확장 쪽 runner 도 함께 묶인다 (불변식 10).
+  //   타임아웃 만료는 기존 catch 로 떨어져 재시도 경로를 그대로 탄다.
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       const res = await fetch(env.LLM_URL || DEFAULT_LLM_URL, {
@@ -153,6 +165,9 @@ async function translateBatch(env, batch, target, ctxB = [], ctxA = []) {
 }
 
 // ── 긴 줄 강제 분할 (LLM 이 제한을 어겨도 자막은 짧게 유지) ──────────
+// TODO(phase6): 70 은 1차 프롬프트가 요구하는 "5~12 단어"(영어로 대략 60~75자)와 충돌해서
+//   거의 모든 청크가 2차 분할 경로를 타게 만든다. 85 정도로 올려 2차 패스 자체가 드물게
+//   발동하도록 한다. Phase 4 측정 4 에서 줄 길이 육안 확인 후 확정.
 const MAX_LINE_CHARS = 70;
 
 /** 절 경계(쉼표·마침표류)로 쪼개고, 그래도 긴 조각은 단어 경계에서 자른다 */
@@ -236,6 +251,9 @@ number of parts so each part translates its corresponding original part.
 Output ONLY: {"items":[{"parts":[{"o":"...","t":"..."}]}]} — items in input order.
 No markdown fences, no commentary.`;
 
+// TODO(phase6): enforceShortLines 에서 이 함수 호출을 걷어내면 llmSplitLines 와 SPLIT_SYSTEM
+//   의 호출자가 0이 된다. 삭제할지 남길지는 Phase 4 측정 4(품질 회귀)를 보고 사용자가 정한다.
+//   품질 회귀가 크면 크리티컬 패스 밖(ctx.waitUntil 로 캐시만 개선)으로 옮기는 안이 남아 있다.
 async function llmSplitLines(env, items) {
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
@@ -277,6 +295,10 @@ async function enforceShortLines(env, lines) {
     k: Math.min(6, Math.ceil(lines[i].orig.length / 55)),
   }));
   // 한 번에 너무 많이 보내지 않는다
+  // TODO(phase6): 이 LLM 2차 패스를 크리티컬 패스에서 제거하고 splitLine() 기계 분할만 쓴다.
+  //   지금은 70자 초과 줄이 하나만 있어도 LLM 왕복이 1회 더 붙어 청크당 지연이 사실상 2배가
+  //   된다 — "첫 자막까지 오래 걸린다"의 두 번째 원인이다 (불변식 9: 청크당 왕복 1회 이하).
+  //   대가는 원문·번역의 줄바꿈 위치가 어긋나는 품질 회귀이며, Phase 4 측정 4 로 크기를 잰다.
   const results = [];
   for (let i = 0; i < items.length; i += 30) {
     const part = env.OPENAI_API_KEY ? await llmSplitLines(env, items.slice(i, i + 30)) : null;
@@ -355,6 +377,8 @@ async function handleSubtitle(request, env, ctx) {
   const fingerprint = await sha1(
     [...ctxB, "\u0002", ...segments.map((s) => s.text), "\u0002", ...ctxA].join("\u0001")
   );
+  // TODO(phase6): 캐시 키를 v5 → v6 으로 올린다. MAX_LINE_CHARS 조정과 2차 분할 제거로
+  //   출력 줄 형태가 바뀌는데, 키를 그대로 두면 옛 형태의 캐시가 계속 서빙된다 (불변식 6).
   const key = `sub:v5:${videoId}:${lang}:${target}:${fingerprint.slice(0, 12)}`;  // v5: 문맥 연결 번역
 
   const hit = env.SUBS && (await env.SUBS.get(key, "json"));
@@ -483,10 +507,16 @@ async function handleWord(request, env, ctx) {
 }
 
 // ── 페이지 번역 (문단 밑에 번역 삽입) ───────────────────────────────
-const PAGE_SYSTEM = (target) => `Translate each numbered text into ${target} for a reader skimming a web page.
-- Keep the tone and register of the source.
+const PAGE_SYSTEM = (target) => `Translate each numbered text into ${target}, as a professional translator would for a published ${target} edition of this web page.
+- Translate meaning, not words: rephrase into what a native ${target} writer
+  would naturally say. Never leave stiff, word-for-word phrasing.
+- Keep the register consistent: documentation in plain declarative style,
+  casual writing in a casual voice.
 - Keep proper nouns, code, commands, and technical identifiers untranslated.
 - If a text is already in ${target}, return it unchanged.
+- Texts may contain inline markers like <t0>…</t0> (links, bold, code spans).
+  Keep each marker pair, with the SAME number, around the corresponding
+  translated words. Never drop, add, nest, or renumber markers.
 Output ONLY: {"t":["...","..."]} — one translation per input, same order, same count.
 No markdown fences, no commentary.`;
 
@@ -499,7 +529,7 @@ async function handlePage(request, env, ctx) {
   const clean = texts.map((t) => String(t).slice(0, 2000));
 
   const fp = await sha1(clean.join("") + "" + target);
-  const key = `page:v1:${fp.slice(0, 16)}`;
+  const key = `page:v2:${fp.slice(0, 16)}`;
   const hit = env.SUBS && (await env.SUBS.get(key, "json"));
   if (hit) return json({ t: hit, cached: true });
   if (!env.OPENAI_API_KEY) return json({ error: "OPENAI_API_KEY 미설정" }, 500);
@@ -515,7 +545,7 @@ async function handlePage(request, env, ctx) {
         },
         body: JSON.stringify({
           model: LLM_MODEL,
-          reasoning: { effort: REASONING },
+          reasoning: { effort: "medium" },   // 페이지 번역은 실시간성이 덜해 품질 우선
           response_format: { type: "json_object" },
           messages: [
             { role: "system", content: PAGE_SYSTEM(target) },

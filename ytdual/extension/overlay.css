@@ -32,24 +32,37 @@
   padding-bottom: 2px;
 }
 
-/* 폰용 토글 버튼 */
-#ytdual-btn {
+/* 컨트롤 바 (모바일·PC 공용) */
+#ytdual-bar {
   position: fixed;
   right: 12px;
   bottom: 84px;
   z-index: 2147483001;
-  padding: 9px 14px;
-  border: none;
+  display: flex;
+  gap: 4px;
+  padding: 5px 6px;
   border-radius: 999px;
   background: rgba(20, 20, 20, .82);
-  color: #fff;
-  font: 600 13px/1 system-ui, sans-serif;
   backdrop-filter: blur(6px);
   box-shadow: 0 2px 10px rgba(0, 0, 0, .4);
+}
+
+#ytdual-bar button {
+  border: none;
+  border-radius: 999px;
+  padding: 7px 12px;
+  background: transparent;
+  color: #fff;
+  font: 600 13px/1 system-ui, sans-serif;
   cursor: pointer;
 }
 
-#ytdual-btn:active { transform: scale(.94); }
+#ytdual-bar button:hover { background: rgba(255, 255, 255, .14); }
+#ytdual-bar button:active { transform: scale(.94); }
+#ytdual-bar #ytdual-btn-toggle.on {
+  background: var(--ytdual-trans-color, #ffe27a);
+  color: #222;
+}
 
 /* 단어 탭 저장 */
 #ytdual-orig { pointer-events: none; }

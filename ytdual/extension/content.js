@@ -22,10 +22,46 @@ const DEFAULTS = {
   uid: "",
 };
 
+/**
+ * @typedef {object} Segment  json3(또는 패널 수집)에서 나온 원문 조각 하나
+ * @property {number} start  초
+ * @property {number} end    초
+ * @property {string} text
+ */
+
+/**
+ * @typedef {object} Line  오버레이가 실제로 렌더하는 자막 한 줄
+ * @property {number}  start  초
+ * @property {number}  end    초
+ * @property {string}  orig   원문
+ * @property {string}  trans  번역문. raw 줄은 "" 이다
+ * @property {boolean} [raw]  true = 아직 번역 전인 원문 자리표시자.
+ *                            번역이 도착하면 이 줄들은 제거되고 번역 줄로 교체된다.
+ */
+
+/**
+ * @typedef {object} Chunk  Worker 로 한 번에 보내는 번역 단위
+ * @property {number}    i0    segments 배열에서의 시작 인덱스
+ * @property {Segment[]} segs
+ * @property {number}    t0    segs 첫 줄의 start — 번역본을 끼워 넣을 구간의 시작
+ * @property {number}    t1    segs 마지막 줄의 end — 구간의 끝
+ */
+
+/**
+ * @typedef {object} Perf  지연 측정값. 전부 performance.now() 기준 ms.
+ * @property {number}   t0           start() 진입 시각
+ * @property {number}   tPlayer      플레이어 데이터 확보까지
+ * @property {number}   tSegs        원문 세그먼트 확보까지
+ * @property {number}   tFirstPaint  원문 자막이 화면에 처음 뜨기까지
+ * @property {number}   tFirstTrans  번역 자막이 화면에 처음 뜨기까지
+ * @property {number[]} chunkMs      청크별 왕복 시간
+ */
+
 let cfg = { ...DEFAULTS };
 let state = {
   videoId: null,
   title: "",
+  /** @type {Line[]} start 오름차순. raw 줄과 번역 줄이 한 배열에 섞여 산다 */
   lines: [],
   idx: -1,
   active: false,
@@ -34,6 +70,11 @@ let state = {
   queue: [],      // 아직 Worker 로 못 보낸 카드
   flushing: false,
   asr: null,      // 전사 모드 세션 (자막 트랙 없는 영상)
+  gen: 0,         // start() 세대 번호. 같은 영상을 재시작해도 지난 세대 응답을 가려낸다
+  /** @type {AbortController|null} 이번 세대의 진행 중 요청들을 한 번에 끊는 손잡이 */
+  abort: null,
+  /** @type {Perf} */
+  perf: { t0: 0, tPlayer: 0, tSegs: 0, tFirstPaint: 0, tFirstTrans: 0, chunkMs: [] },
 };
 
 const $ = (s, r = document) => r.querySelector(s);
@@ -65,6 +106,13 @@ function sliceBalancedJSON(src, openIdx) {
     else if (c === "}" && --depth === 0) return src.slice(openIdx, i + 1);
   }
   return null;
+}
+
+/** 이미 로드된 문서의 <script> 에서 ytInitialPlayerResponse 를 읽는다.
+ *  못 찾으면 null — 호출부가 fetchPlayerResponse() 로 폴백한다.
+ *  @returns {object|null} */
+function readPlayerResponseFromDOM() {
+  throw new Error("not implemented");
 }
 
 async function fetchPlayerResponse(videoId) {
@@ -160,9 +208,14 @@ async function scrapeTranscriptPanel() {
 }
 
 // ── 3. Worker ────────────────────────────────────────────────────────
-async function requestTranslation(videoId, lang, segments, ctx = {}) {
+async function requestTranslation(videoId, lang, segments, ctx = {}, signal = null) {
+  // TODO(phase6): 요청 1회의 타임아웃을 건다. 내부에 AbortController 를 만들고 전달받은
+  //   signal 의 "abort" 이벤트를 addEventListener 로 수동 연결한다. AbortSignal.any() 는
+  //   Firefox 124+ 라 manifest 의 strict_min_version 115 에서 조용히 깨진다.
+  //   타임아웃이 없으면 멈춘 업스트림 하나가 runner 슬롯을 영구 점유해 처리량이 반토막 난다 (불변식 10).
   for (let attempt = 0; ; attempt++) {
     try {
+      // TODO(phase6): fetch 옵션에 signal 을 넘긴다.
       const res = await fetch(`${cfg.endpoint}/api/subtitle`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -486,10 +539,41 @@ function positionOverlay() {
   if (!video || !box) return;
   const r = video.getBoundingClientRect();
   if (!r.width) return;
+  // 네이티브 자막처럼: 평소엔 영상 맨 아래, 컨트롤(재생바)이 보이면 그 위로
+  const player = document.getElementById("movie_player");
+  const controlsVisible = player && !player.classList.contains("ytp-autohide");
+  const lift = controlsVisible ? 72 : 14;
   box.style.left = `${r.left}px`;
   box.style.width = `${r.width}px`;
-  box.style.top = `${r.top + r.height - Math.max(90, r.height * 0.2)}px`;
+  box.style.top = `${r.top + r.height - lift - box.offsetHeight}px`;
   box.style.fontSize = `${cfg.fontSize}px`;
+}
+
+// ── state.lines 조립 ─────────────────────────────────────────────────
+
+/** 번역 전 원문을 state.lines 에 자리표시자(raw)로 깔고 렌더를 시작한다.
+ *  번역을 기다리는 동안 화면이 비어 있지 않게 하는 것이 유일한 목적이다.
+ *  @param {Segment[]} segments
+ *  @returns {void} */
+function seedRawLines(segments) {
+  // TODO(phase6): segments 를 { start, end, orig: text, trans: "", raw: true } 로 옮겨
+  //   state.lines 에 넣고, state.idx 를 무효화한 뒤 loop() 를 시작한다.
+  //   perf.tFirstPaint 를 여기서 기록한다 (계측 1단계).
+  throw new Error("not implemented");
+}
+
+/** [t0, t1) 구간의 raw 줄을 걷어내고 번역 줄로 갈아끼운다. start 정렬을 유지한다.
+ *  t0/t1 은 응답이 아니라 청크에서 온다 — 워커가 일부 줄을 버려도 구간 전체가
+ *  확실히 교체되어야 raw 와 번역본이 같은 시각에 겹치지 않는다.
+ *  @param {Line[]} lines  워커가 돌려준 번역 줄
+ *  @param {number} t0     교체할 구간의 시작(초)
+ *  @param {number} t1     교체할 구간의 끝(초)
+ *  @returns {void} */
+function mergeTranslated(lines, t0, t1) {
+  // TODO(phase6): state.lines 에서 [t0, t1) 에 걸치는 raw 줄을 전부 제거하고 lines 를 넣은 뒤
+  //   start 오름차순을 복구한다 (불변식 2·3). 이미 번역된 줄(raw 아님)은 건드리지 않는다.
+  //   state.idx 를 무효화해 다음 render 가 다시 계산하게 한다.
+  throw new Error("not implemented");
 }
 
 function findLine(t) {
@@ -565,10 +649,21 @@ async function start() {
   stop({ keepBox: true });
   state.videoId = videoId;
   state.active = true;
+  // TODO(phase6): state.gen 을 1 올리고 그 값을 지역변수(myGen)로 잡는다. 아래 모든 응답을
+  //   이 세대 번호로 검사해야 같은 영상을 정지 후 재시작했을 때 이전 요청의 응답이
+  //   새 세션에 섞이지 않는다 (불변식 4).
+  // TODO(phase6): state.abort = new AbortController() — 이 세대의 모든 fetch 에 물릴 신호.
+  // TODO(phase6): state.perf 를 초기화하고 perf.t0 = performance.now() 기록 (계측 1단계).
+  syncBar();
 
   try {
     showStatus("자막 트랙 확인 중", true);
+    // TODO(phase6): readPlayerResponseFromDOM() 을 먼저 시도하고 null 일 때만
+    //   fetchPlayerResponse(videoId) 로 폴백한다. 여기서 인라인으로 처리하고 래퍼 함수는
+    //   만들지 않는다 (호출자가 하나뿐). 같은 페이지 HTML 을 네트워크로 다시 받는 낭비 제거.
+    //   단 Phase 4 에서 perf.tPlayer 가 1초 미만이면 이 항목은 통째로 버린다.
     const player = await fetchPlayerResponse(videoId);
+    // TODO(phase6): perf.tPlayer 기록 (계측 1단계).
     state.title = player?.videoDetails?.title || document.title;
 
     // 라이브는 완결된 자막 트랙이 없다 → 바로 Whisper 전사 모드
@@ -587,6 +682,11 @@ async function start() {
     // 트랙이 없거나 두 경로 모두 막힘 → Whisper 전사 모드
     if (!segments.length) { startAsr(); return; }
 
+    // TODO(phase6): perf.tSegs 기록 (계측 1단계).
+    // TODO(phase6): seedRawLines(segments) 호출 — 원문을 raw 줄로 즉시 깔고 렌더를 시작한다.
+    //   "첫 자막까지 오래 걸린다"의 핵심 해결책이며, 이 시점 이후로는 화면에 자막이
+    //   비어 있으면 안 된다 (불변식 1).
+
     // 긴 자막을 한 요청으로 보내면 응답까지 몇 분씩 걸려 연결이 끊긴다.
     // 작은 청크로 나눠, "지금 보고 있는 지점" 주변부터 우선 번역해 바로 띄우고
     // 나머지는 백그라운드로 채운다. 이웃 세그먼트는 문맥(CTX)으로 함께 보낸다.
@@ -594,50 +694,96 @@ async function start() {
     const CTX_N = 8;
     const chunks = [];
     for (let i = 0; i < segments.length; i += TRANSLATE_CHUNK) {
+      // TODO(phase6): t0/t1 도 함께 넣는다 — t0 = 첫 seg 의 start, t1 = 마지막 seg 의 end.
+      //   mergeTranslated 가 raw 를 걷어낼 구간의 권위 있는 경계다. 워커가 빈 줄을 버리므로
+      //   응답에서 유도하면 구간이 좁아져 가장자리 raw 가 살아남는다 (불변식 3).
       chunks.push({ i0: i, segs: segments.slice(i, i + TRANSLATE_CHUNK) });
     }
-    const now = $("video")?.currentTime || 0;
-    const score = (c) => {
-      const s = c.segs[0].start, e = c.segs[c.segs.length - 1].end;
-      if (now >= s - 5 && now <= e) return -1;          // 지금 재생 중인 청크 최우선
-      return s >= now ? s - now : 1e6 + (now - s);      // 앞쪽 순서대로, 지나간 쪽은 마지막에
-    };
-    const order = [...chunks].sort((a, b) => score(a) - score(b));
-
-    showStatus(`번역 중 (${segments.length}줄)`, true);
-    for (let k = 0; k < order.length; k++) {
-      const c = order[k];
-      let lines;
-      try {
-        lines = await requestTranslation(videoId, track.languageCode, c.segs, {
-          before: segments.slice(Math.max(0, c.i0 - CTX_N), c.i0).map((s) => s.text),
-          after: segments.slice(c.i0 + c.segs.length, c.i0 + c.segs.length + CTX_N).map((s) => s.text),
-        });
-      } catch (e) {
-        // 이미 자막이 떠 있으면 오류로 전부 덮지 말고 있는 것만 유지한다
-        log(`번역 청크 ${k + 1}/${order.length} 실패`, e.message);
-        if (!state.lines.length) throw e;
-        toast(`번역 일부 실패`);
-        break;
+    // 우선순위는 고정 순서가 아니라 "매 청크마다" 현재 재생바 위치로 다시
+    // 고른다 — 시킹해도 다음 요청부터 그 지점이 최우선이 된다.
+    const pending = new Set(chunks);
+    const nextChunk = () => {
+      const t = $("video")?.currentTime || 0;
+      let best = null, bestScore = Infinity;
+      for (const c of pending) {
+        const s0 = c.segs[0].start, e0 = c.segs[c.segs.length - 1].end;
+        const sc = t >= s0 - 5 && t <= e0 ? -1        // 지금 재생 중인 청크 최우선
+          : s0 >= t ? s0 - t                          // 앞쪽은 가까운 순서
+          : 1e6 + (t - s0);                           // 지나간 쪽은 맨 뒤
+        if (sc < bestScore) { bestScore = sc; best = c; }
       }
-      if (state.videoId !== videoId || !state.active) return;   // 도중에 이동/중지됨
-      state.lines = state.lines.concat(lines).sort((a, b) => a.start - b.start);
-      state.idx = -2;
-      if (!state.rafId) loop();          // 첫 청크 도착 즉시 표시 시작
-      log(`번역 ${k + 1}/${order.length} 청크 (${state.lines.length}줄)`);
-    }
+      return best;
+    };
+
+    // TODO(phase6): 이 showStatus 를 제거한다. seedRawLines 이후에는 원문 자막이 이미 떠
+    //   있는데 여기서 오버레이를 "⏳ 번역 중" 으로 덮어써 버린다 (불변식 1 위반).
+    //   진행 상황을 알리려면 자막을 가리지 않는 수단(하단 바 라벨 등)을 쓴다.
+    showStatus(`번역 중 (${segments.length}줄)`, true);
+    // TODO(phase6): 실패 청크를 1회 한정으로 pending 에 되돌리기 위한 재시도 기록
+    //   (Set<Chunk>)을 여기 둔다. 지금은 실패한 청크가 영구히 버려져 그 구간이 영영
+    //   번역되지 않는다 — 사용자에겐 "느리다"로 보인다 (불변식 8).
+    let done = 0, failed = 0;
+    const runner = async () => {
+      for (;;) {
+        // TODO(phase6): 이 가드를 state.gen !== myGen 검사로 바꾼다. videoId 비교는
+        //   같은 영상을 정지 후 재시작한 경우를 못 잡는다 (불변식 4).
+        if (state.videoId !== videoId || !state.active) return;
+        const c = nextChunk();
+        if (!c) return;
+        pending.delete(c);
+        try {
+          // TODO(phase6): 요청 직전/직후 performance.now() 를 재서 perf.chunkMs 에 넣는다 (계측 1단계).
+          // TODO(phase6): 5번째 인자로 state.abort.signal 을 넘긴다.
+          const lines = await requestTranslation(videoId, track.languageCode, c.segs, {
+            before: segments.slice(Math.max(0, c.i0 - CTX_N), c.i0).map((s) => s.text),
+            after: segments.slice(c.i0 + c.segs.length, c.i0 + c.segs.length + CTX_N).map((s) => s.text),
+          });
+          // TODO(phase6): 이 가드도 state.gen !== myGen 로 (불변식 4).
+          if (state.videoId !== videoId || !state.active) return;
+          // TODO(phase6): concat+sort 를 mergeTranslated(lines, c.t0, c.t1) 로 교체한다.
+          //   지금은 번역 줄을 "추가"만 하므로, raw 줄을 깔기 시작하면 같은 시각에 원문 줄과
+          //   번역 줄이 둘 다 남아 자막이 겹쳐 보인다 (불변식 3).
+          state.lines = state.lines.concat(lines).sort((a, b) => a.start - b.start);
+          state.idx = -2;
+          // TODO(phase6): 이 loop() 시동을 삭제한다 — seedRawLines 가 이미 렌더를 돌리고 있다.
+          if (!state.rafId) loop();      // 첫 청크 도착 즉시 표시 시작
+          // TODO(phase6): 첫 번역 도착이면 perf.tFirstTrans 기록 (계측 1단계).
+          log(`번역 ${++done}/${chunks.length} 청크 (${state.lines.length}줄)`);
+        } catch (e) {
+          // TODO(phase6): abort 로 인한 실패는 실패로 세지 말고 조용히 return 한다.
+          // TODO(phase6): 아직 재시도한 적 없는 청크면 pending 에 다시 넣는다 (1회 한정).
+          //   되돌리지 않으면 그 구간은 raw 원문 상태로 영구히 남는다 (불변식 8).
+          failed++;
+          log(`번역 청크 실패 (${failed}번째)`, e.message);
+        }
+      }
+    };
+    // TODO(phase6): runner 개수를 Phase 4 측정 1(동시성 프로브) 결과로 정한다.
+    //   업스트림(127.0.0.1:8317)이 직렬 처리로 나오면 이 항목은 폐기하고 2 를 유지한다.
+    await Promise.all([runner(), runner()]);   // 2개 동시 — 따라잡기 빠르게
+    // TODO(phase6): 이 가드도 state.gen !== myGen 로 (불변식 4).
+    if (state.videoId !== videoId || !state.active) return;
+    // TODO(phase6): seedRawLines 이후 state.lines 는 절대 비지 않으므로 이 throw 는 도달
+    //   불가가 된다. "전부 실패" 판정을 done === 0 기준으로 바꾼다.
+    if (!state.lines.length) throw new Error("번역 실패");
+    if (failed) toast(`번역 ${failed}개 청크 실패`);
     log(`준비 완료: ${state.lines.length}줄`);
   } catch (e) {
     console.error("[YT Dual]", e);
     showStatus(`오류: ${e.message}`);
     state.active = false;
+    syncBar();
   }
 }
 
 function stop({ keepBox = false } = {}) {
   stopAsr();
   if (state.rafId) cancelAnimationFrame(state.rafId);
+  // TODO(phase6): state.abort?.abort() 로 진행 중인 요청을 실제로 끊고 state.abort = null.
+  //   지금은 정지·영상 이동 후에도 fetch 가 살아남아 runner 슬롯을 계속 물고 있다 (불변식 7).
+  // TODO(phase6): state.gen 을 올려 이 세대의 남은 응답을 무효화한다 (불변식 4).
   Object.assign(state, { rafId: null, lines: [], idx: -1, loop: false, active: false });
+  syncBar();
   if (!keepBox) $("#ytdual-box")?.remove();
 }
 
@@ -649,8 +795,17 @@ document.addEventListener("keydown", (e) => {
   if (el?.tagName === "INPUT" || el?.tagName === "TEXTAREA" || el?.isContentEditable) return;
 
   if (e.code === "Escape" && popEl) { e.preventDefault(); closeWordPop(); return; }
-  if (e.altKey && e.code === "KeyT") { e.preventDefault(); toggle(); return; }
+  if (e.altKey && e.code === "KeyY") { e.preventDefault(); toggle(); return; }
+  // Alt+A: 번역 줄 토글 (일반 페이지의 페이지 번역 토글과 키를 통일)
+  if (e.altKey && e.code === "KeyA") {
+    e.preventDefault();
+    cfg.showTranslation = !cfg.showTranslation;
+    state.idx = -2;
+    return;
+  }
   if (!state.active) return;
+  // 문장 단축키는 Ctrl 조합만 — 단일 키를 가로채면 유튜브 기본 단축키가 죽는다
+  if (!e.ctrlKey || e.metaKey || e.altKey) return;
 
   const video = $("video");
   switch (e.code) {
@@ -660,10 +815,6 @@ document.addEventListener("keydown", (e) => {
       break;
     case "KeyS":                       // 현재 문장 통째로 저장
       if (state.idx >= 0) saveCard(state.lines[state.idx].orig.split(/\s+/)[0] || "—");
-      break;
-    case "KeyZ":
-      cfg.showTranslation = !cfg.showTranslation;
-      state.idx = -2;
       break;
     case "Equal":
       cfg.fontSize = Math.min(48, cfg.fontSize + 2);
@@ -687,12 +838,22 @@ document.addEventListener("keydown", (e) => {
 });
 
 function addButton() {
-  if ($("#ytdual-btn")) return;
-  const b = document.createElement("button");
-  b.id = "ytdual-btn";
-  b.textContent = "자막";
-  b.addEventListener("click", toggle);
-  document.body.appendChild(b);
+  if ($("#ytdual-bar")) return;
+  const bar = document.createElement("div");
+  bar.id = "ytdual-bar";
+  bar.innerHTML = `
+    <button id="ytdual-btn-toggle" title="이중 자막 켜기/끄기 (Alt+Y)">자막</button>
+    <button id="ytdual-btn-opts" title="설정">⚙</button>`;
+  bar.querySelector("#ytdual-btn-toggle").addEventListener("click", toggle);
+  bar.querySelector("#ytdual-btn-opts").addEventListener("click", () => {
+    browser.runtime.sendMessage({ type: "ytdual-open-options" });
+  });
+  document.body.appendChild(bar);
+  syncBar();
+}
+
+function syncBar() {
+  $("#ytdual-btn-toggle")?.classList.toggle("on", state.active);
 }
 
 // ── SPA 내비게이션 ───────────────────────────────────────────────────
