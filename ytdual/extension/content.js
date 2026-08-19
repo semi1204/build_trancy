@@ -72,9 +72,18 @@ const DEFAULTS = {
  * @property {number}  start  초
  * @property {number}  end    초
  * @property {string}  orig   원문
- * @property {string}  trans  번역문. raw 줄은 "" 이다
- * @property {boolean} [raw]  true = 아직 번역 전인 원문 자리표시자.
- *                            번역이 도착하면 이 줄들은 제거되고 번역 줄로 교체된다.
+ * @property {string}  trans  번역문. 아직 번역 전이면 "" 이다
+ * @property {"fast"|"full"|null} tier  이 줄이 지금 담고 있는 번역의 품질 등급.
+ *   null  = 아직 번역 전인 원문 자리표시자 (옛 raw:true 와 같은 뜻)
+ *   fast  = 조각별 번역. 재생 위치 근처라 속도를 우선해 받은 것 (약 2.7초)
+ *   full  = 병합·분할된 번역. 정확도를 우선해 받은 것 (약 9.7초)
+ *
+ * 등급을 boolean raw 와 따로 두지 않고 이 한 필드로 합친다. 두 필드를 두면
+ * "raw 인데 tier 가 full" 같은 불가능한 상태가 표현 가능해지고, 그 모순이
+ * 곧바로 I3(겹침) 류의 버그가 된다. raw 는 tier === null 과 동치다.
+ *
+ * ★ Phase 6 에서 이행한다. 현재 코드는 아직 raw:true 를 쓰며, 읽는 곳은
+ *   mergeTranslated 한 곳뿐이라 이행 지점은 2곳(seedRawLines·mergeTranslated)이다.
  */
 
 /**
@@ -106,6 +115,10 @@ const DEFAULTS = {
  *                                   chunkMs 와 같은 인덱스로 정렬된다 — i번째 왕복의
  *                                   토큰 수가 tokens[i] 다. 워커가 usage 를 안 실어
  *                                   보내면 0 이 들어간다.
+ * @property {{fast: number, full: number}} tierCounts  등급별 요청 횟수.
+ *   거리 기반 2단은 같은 구간을 fast 로 한 번, full 로 다시 한 번 번역할 수 있다.
+ *   fast + full 이 청크 수보다 얼마나 큰지가 곧 중복 번역 비용이고, 그게 커지면
+ *   2단 설계 자체가 손해다. 이 값 없이는 그 손익을 볼 방법이 없다.
  */
 
 let cfg = { ...DEFAULTS };
@@ -129,6 +142,7 @@ let state = {
   perf: {
     t0: 0, tPlayer: 0, tSegs: 0, tFirstPaint: 0, tFirstTrans: 0,
     chunkMs: [], segsPerChunk: 0, tokens: [],
+    tierCounts: { fast: 0, full: 0 },
   },
 };
 
@@ -273,12 +287,13 @@ async function scrapeTranscriptPanel() {
  *  I8   signal 은 호출자가 지역 캡처한 것을 받는다. state.abort 를 직접 읽지 않는다. */
 /**
  * 목표 계약 (Phase 6 에서 구현). 지금은 Line[] 만 반환한다.
- * 매개변수는 바뀌지 않는다. 반환이 배열에서 객체로 바뀌므로 호출부 1곳도 함께 바뀐다.
- * @returns {Promise<{lines: Line[], usage?: Usage}>}
- *   usage 를 이 경로로 끌어올리지 않으면 Phase 4 의 토큰 측정이 불가능하다.
- *   응답 본문은 이 함수 안에서 소비되므로 호출부가 따로 읽을 방법이 없다.
+ * @param {"fast"|"full"} mode  등급. 워커의 프롬프트·응답 형태가 이 값으로 갈린다.
+ * @returns {Promise<{lines?: Line[], t?: string[], usage?: Usage}>}
+ *   mode=full 이면 lines, mode=fast 면 t 가 온다. 둘은 동시에 오지 않는다.
+ *   usage 를 이 경로로 끌어올리지 않으면 토큰 측정이 불가능하다 — 응답 본문은
+ *   이 함수 안에서 소비되므로 호출부가 따로 읽을 방법이 없다.
  */
-async function requestTranslation(videoId, lang, segments, ctx = {}, signal = null) {
+async function requestTranslation(videoId, lang, segments, ctx = {}, signal = null, mode = "full") {
   // TODO(phase6): 요청 1회의 타임아웃을 건다. 내부에 AbortController 를 만들고 전달받은
   //   signal 의 "abort" 이벤트를 addEventListener 로 수동 연결한다. AbortSignal.any() 는
   //   Firefox 124+ 라 manifest 의 strict_min_version 115 에서 조용히 깨진다.
@@ -634,6 +649,8 @@ function positionOverlay() {
  *  @param {Segment[]} segments
  *  @returns {void} */
 function seedRawLines(segments) {
+  // TODO(phase6): raw: true → tier: null 로 바꾼다. Line typedef 가 이미 tier 로 정의돼
+  //   있고, 두 필드를 병존시키면 "raw 인데 tier 가 full" 같은 모순 상태가 표현 가능해진다.
   state.lines = segments.map((s) => ({
     start: s.start, end: s.end, orig: s.text, trans: "", raw: true,
   }));
@@ -659,10 +676,34 @@ function seedRawLines(segments) {
  *  @param {number} t1     교체할 구간의 끝(초)
  *  @returns {void} */
 function mergeTranslated(lines, t0, t1) {
+  // TODO(phase6): ★ 이 필터가 설계 D 에서 가장 위험한 한 줄이다. 조건을 l.raw 에서
+  //   "tier !== 'full'" 로 넓혀야 한다. 지금 조건 그대로면 fast 로 채워진 줄은 raw 가
+  //   아니라서 살아남고, 아래 concat 이 full 줄을 덧붙여 같은 시각을 두 줄이 덮는다
+  //   (I3 위반). 화면에는 자막이 두 개 겹쳐 보인다.
+  // TODO(phase6): 들어오는 lines 에 tier: "full" 을 찍는다. 안 찍으면 tier 가 undefined 라
+  //   다음 fast 응답이 이 줄을 덮어써 정확한 번역이 거친 번역으로 후퇴한다 (I21).
   // raw 만 걷어낸다 — 청크는 뒤섞인 순서로 도착하므로 남의 번역 결과를 지우면 안 된다 (I4)
   const kept = state.lines.filter((l) => !(l.raw && l.start >= t0 && l.start < t1));
   state.lines = kept.concat(lines).sort((a, b) => a.start - b.start);   // I2
   state.idx = -2;
+}
+
+/** 조각별(fast) 번역을 state.lines 에 제자리 대입한다. 배열을 재구성하지 않는다.
+ *  seedRawLines 가 segments 와 1:1 로 줄을 깔았으므로 lines[i0 + j] 가 곧 segs[j] 다.
+ *
+ *  불변식 — 이 함수가 반환된 뒤 항상 참이어야 한다:
+ *    I2  자명하게 유지된다. 줄을 넣거나 빼거나 재정렬하지 않는다.
+ *    I3  자명하게 유지된다. start/end 를 건드리지 않으므로 겹침이 생길 수 없다.
+ *    I21 이미 full 을 받은 줄은 덮지 않는다. 늦게 도착한 거친 번역이 정확한
+ *        번역을 지우면 사용자가 보던 자막이 뒤로 후퇴한다.
+ *    I18 trans.length 는 반드시 segs.length 와 같다. 다르면 인덱스가 밀려
+ *        엉뚱한 시각에 엉뚱한 번역이 붙으므로, 호출 전에 검사해 통째로 버린다.
+ *
+ *  @param {number}   i0     이 청크가 segments 에서 시작한 인덱스
+ *  @param {string[]} trans  조각과 같은 순서·같은 길이의 번역문
+ *  @returns {void} */
+function applyFast(i0, trans) {
+  throw new Error("not implemented");
 }
 
 function findLine(t) {
@@ -774,6 +815,11 @@ async function start() {
 
     state.perf.tSegs = performance.now() - state.perf.t0;
     seedRawLines(segments);        // I1: 이 시점부터 화면은 비지 않는다
+    // TODO(phase6): 여기서 document.documentElement 에 클래스를 붙여 유튜브 native 자막을
+    //   숨긴다 (한 줄, 래퍼 함수 없음). stop() 에서 떼어낸다. 반드시 seedRawLines 뒤여야
+    //   한다 — 앞에서 끄면 원문 확보를 기다리는 동안 사용자는 아무 자막도 못 본다.
+    //   ★ 실제로 숨기는 CSS 규칙은 overlay.css 에 있어야 하는데 그 파일은 승인된 계획서
+    //   밖이다. 승인 없이는 이 TODO 를 구현할 수 없다.
 
     // 긴 자막을 한 요청으로 보내면 응답까지 몇 분씩 걸려 연결이 끊긴다.
     // 작은 청크로 나눠, "지금 보고 있는 지점" 주변부터 우선 번역해 바로 띄우고
@@ -784,6 +830,10 @@ async function start() {
     //   ★ 측정 1 에서 reasoning 이 "요청당 고정"으로 나오면 작게 쪼개도 이득이
     //   거의 없다 — 그때는 이 값을 바꾸지 말고 Phase 0 으로 되돌아간다.
     const TRANSLATE_CHUNK = 48;
+    // TODO(phase6): 크기가 둘로 갈린다. full 격자는 12 (terra 기준 9.7초), fast 미리보기는
+    //   8 (2.7초). 둘이 정렬될 필요는 없다 — fast 는 제자리 대입이고 full 은 시간 구간
+    //   교체라 서로 다른 격자여도 안전하다. 다만 mergeTranslated 의 필터가 fast 를
+    //   걷어내도록 고쳐진 뒤에만 그렇다.
     const CTX_N = 8;
     const chunks = [];
     for (let i = 0; i < segments.length; i += TRANSLATE_CHUNK) {
@@ -805,6 +855,10 @@ async function start() {
       }
       return best;
     };
+    // TODO(phase6): 등급 판정을 여기 붙인다. 위 sc 가 이미 거리다 — sc === -1 이면 지금
+    //   재생 중인 구간이므로 fast, 아니면 full. 새 거리 계산을 만들지 말고 이 값을 쓴다.
+    //   등급은 청크에 저장하지 않는다. 재큐될 때는 그때의 재생 위치로 다시 정해야
+    //   맞기 때문이다 (시킹했을 수 있다).
 
     // showStatus 없음 — 원문이 이미 떠 있는데 덮어쓰면 I1 위반
     let done = 0, failed = 0;
@@ -828,6 +882,12 @@ async function start() {
           }, sig);
           if (state.gen !== myGen || !state.active) return;   // I6
           state.perf.chunkMs.push(Math.round(performance.now() - tReq));
+          // TODO(phase6): 등급으로 갈린다. fast 면 applyFast(c.i0, res.t), full 이면
+          //   mergeTranslated(res.lines, c.t0, c.t1). 그리고 state.perf.tierCounts 의
+          //   해당 항목을 올린다 — 같은 구간을 두 번 번역하는 비용이 여기서만 보인다.
+          // TODO(phase6): fast 로 받은 구간은 pending 에 되돌려 full 로 한 번 더 받는다.
+          //   안 되돌리면 그 구간은 거친 번역인 채로 영영 남는다. 되돌릴 때 재시도 횟수
+          //   제한(retried)에 걸리지 않도록 승급은 실패 재큐와 구분해야 한다.
           mergeTranslated(lines, c.t0, c.t1);                 // I2·I3·I4
           if (!state.perf.tFirstTrans) state.perf.tFirstTrans = performance.now() - state.perf.t0;
           log(`번역 ${++done}/${chunks.length} 청크 (${state.lines.length}줄)`);
@@ -853,6 +913,8 @@ async function start() {
       tPlayer: Math.round(p.tPlayer), tSegs: Math.round(p.tSegs),
       tFirstPaint: Math.round(p.tFirstPaint), tFirstTrans: Math.round(p.tFirstTrans),
       chunkMedian: p.chunkMs.slice().sort((a, b) => a - b)[p.chunkMs.length >> 1],
+      // TODO(phase6): tierCounts 도 함께 찍는다. fast+full 이 청크 수보다 얼마나 큰지가
+      //   중복 번역 비용이고, 그게 크면 2단 설계가 손해라는 신호다.
       // TODO(phase6): segsPerChunk 와 토큰 통계(중앙값, reasoning 비중)를 함께 찍는다.
       //   이 로그가 Phase 4 스윕의 유일한 관측창이라 크기와 토큰이 없으면 비교가 안 된다.
       tAllDone: Math.round(performance.now() - p.t0), chunks: chunks.length, failed,
@@ -868,6 +930,8 @@ async function start() {
 function stop({ keepBox = false } = {}) {
   stopAsr();
   if (state.rafId) cancelAnimationFrame(state.rafId);
+  // TODO(phase6): seedRawLines 에서 붙인 native 자막 숨김 클래스를 여기서 떼어낸다.
+  //   안 떼면 확장을 꺼도 유튜브 자막이 계속 숨겨진 채로 남는다.
   state.abort?.abort();   // I7: 진행 중인 요청을 실제로 끊는다
   state.gen++;            // I6: 이 세대의 남은 응답을 무효화
   Object.assign(state, { rafId: null, lines: [], idx: -1, loop: false, active: false, abort: null });
