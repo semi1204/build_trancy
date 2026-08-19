@@ -17,7 +17,9 @@
     "https://www.youtube.com/*",
     "https://sub.example.workers.dev/*",
     "http://127.0.0.1:8765/*",
-    "http://localhost:8765/*"
+    "http://localhost:8765/*",
+    "http://127.0.0.1:8787/*",
+    "http://localhost:8787/*"
   ],
 
   "content_scripts": [

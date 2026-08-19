@@ -481,11 +481,22 @@ async function start() {
     // 트랙이 없거나 두 경로 모두 막힘 → Whisper 전사 모드
     if (!segments.length) { startAsr(); return; }
 
+    // 긴 자막을 한 요청으로 보내면 응답까지 몇 분씩 걸려 연결이 끊긴다.
+    // 청크로 나눠 순차 요청하고, 첫 청크부터 바로 자막을 띄운다.
+    const TRANSLATE_CHUNK = 120;
+    const chunks = [];
+    for (let i = 0; i < segments.length; i += TRANSLATE_CHUNK) {
+      chunks.push(segments.slice(i, i + TRANSLATE_CHUNK));
+    }
     showStatus(`번역 중 (${segments.length}줄)`, true);
-    state.lines = await requestTranslation(videoId, track.languageCode, segments);
-
-    state.idx = -2;
-    if (!state.rafId) loop();
+    for (let i = 0; i < chunks.length; i++) {
+      const lines = await requestTranslation(videoId, track.languageCode, chunks[i]);
+      if (state.videoId !== videoId || !state.active) return;   // 도중에 이동/중지됨
+      state.lines = state.lines.concat(lines).sort((a, b) => a.start - b.start);
+      state.idx = -2;
+      if (!state.rafId) loop();          // 첫 청크 도착 즉시 표시 시작
+      log(`번역 ${i + 1}/${chunks.length} 청크 (${state.lines.length}줄)`);
+    }
     log(`준비 완료: ${state.lines.length}줄`);
   } catch (e) {
     console.error("[YT Dual]", e);
