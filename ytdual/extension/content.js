@@ -22,6 +22,44 @@ const DEFAULTS = {
   uid: "",
 };
 
+/* ── 불변식 ───────────────────────────────────────────────────────────
+ * 이 파일이 항상 지켜야 하는 것들. [실측] 은 Phase 4 에서 실행해 확인한 것,
+ * [미검증] 은 브라우저를 돌려봐야 확인되는 것이다.
+ *
+ * 렌더링 / state.lines
+ *  I1  segments 를 확보한 뒤로 화면에 자막이 비는 순간이 없다. 번역을 기다리는
+ *      동안에도 원문(raw)이 떠 있다. 이 시점 이후의 showStatus 는 위반이다.
+ *  I2  state.lines 는 항상 start 오름차순이다.                          [실측]
+ *  I3  같은 시각을 raw 줄과 번역 줄이 동시에 덮지 않는다. findLine 은 start 가
+ *      가장 늦은 줄을 고르므로, 겹치면 번역이 원문으로 되돌아가 보인다.   [실측]
+ *  I4  번역 도착은 raw 를 "교체"한다. "추가"하면 I3 가 깨진다.
+ *  I5  모든 구간은 번역되었거나 raw 원문으로 남는다 — 조용한 빈 구간은 없다. [실측]
+ *
+ * 세션 수명
+ *  I6  지난 세대(gen)의 응답은 state 를 절대 변경하지 않는다. videoId 비교만으로는
+ *      같은 영상을 정지 후 재시작한 경우를 못 잡는다.
+ *  I7  stop() 이후 진행 중인 fetch 는 하나도 살아남지 않는다.           [미검증]
+ *  I8  abort signal 은 start() 진입 시 지역 변수로 캡처한다. stop() 이 state.abort 를
+ *      null 로 만들기 때문에, runner 가 나중에 state.abort.signal 을 읽으면 터진다.
+ *
+ * 지연 예산 (Phase 4 실측: LLM 왕복 70~100초. 모든 항이 이 값에 비례한다)
+ *  I9  청크 하나의 크리티컬 패스에 LLM 왕복은 1회 이하다.               [실측]
+ *  I10 모든 fetch 는 유한한 타임아웃을 가진다. 무기한 대기는 runner 슬롯을
+ *      영구 점유해 처리량을 반토막 낸다.
+ *  I11 재시도 층은 하나뿐이다. 클라와 워커가 각자 재시도하면 횟수가 곱해진다
+ *      (현재 2×3=6회 = 청크 하나에 최대 10분). ★ 현재 코드는 이걸 위반한다.
+ *  I12 클라 타임아웃 > 워커가 쓸 수 있는 최대 시간. 아니면 워커의 재시도가
+ *      끝나기도 전에 클라가 끊어 그 작업이 통째로 버려진다.
+ *  I13 동시 번역 요청은 8개 이하. 8에서 실패 0·저하 15%, 그 이상은 미측정. [실측]
+ *
+ * 범위
+ *  I14 유튜브 DOM 은 읽기만 한다. 쓰는 곳은 우리 오버레이뿐이다.
+ *  I15 번역 작업은 영상 재생을 절대 블로킹하지 않는다.
+ *
+ * 아래 TODO(phase6) 주석들은 Phase 0 계획서의 옛 번호를 인용한다. 대응은 이렇다:
+ *   옛1→I1  옛2→I2  옛3→I3  옛4→I6  옛7→I7  옛8→I5  옛9→W3  옛10→I10
+ * ──────────────────────────────────────────────────────────────────── */
+
 /**
  * @typedef {object} Segment  json3(또는 패널 수집)에서 나온 원문 조각 하나
  * @property {number} start  초
@@ -45,6 +83,11 @@ const DEFAULTS = {
  * @property {Segment[]} segs
  * @property {number}    t0    segs 첫 줄의 start — 번역본을 끼워 넣을 구간의 시작
  * @property {number}    t1    segs 마지막 줄의 end — 구간의 끝
+ *
+ * 불변식: t1 은 반드시 마지막 seg 의 end 다. start 로 바꾸면 안 된다.
+ *   유튜브 자막은 시간상 겹치므로(다음 seg 가 이전 seg 가 끝나기 전에 시작) end 로
+ *   잘라내야 이웃 raw 줄까지 정리되어 I3 가 유지된다. start 로 바꾸면 겹침이 생긴다.
+ *   Phase 4 에서 start 안을 실제로 구현해 측정했고 겹침 2건이 나와 폐기했다.
  */
 
 /**
@@ -70,8 +113,9 @@ let state = {
   queue: [],      // 아직 Worker 로 못 보낸 카드
   flushing: false,
   asr: null,      // 전사 모드 세션 (자막 트랙 없는 영상)
-  gen: 0,         // start() 세대 번호. 같은 영상을 재시작해도 지난 세대 응답을 가려낸다
-  /** @type {AbortController|null} 이번 세대의 진행 중 요청들을 한 번에 끊는 손잡이 */
+  gen: 0,         // start() 세대 번호. 같은 영상을 재시작해도 지난 세대 응답을 가려낸다 (I6)
+  /** @type {AbortController|null} 이번 세대의 진행 중 요청들을 한 번에 끊는 손잡이.
+   *  stop() 에서 null 이 되므로 runner 는 이 필드를 직접 읽지 말고 지역 캡처본을 쓴다 (I8) */
   abort: null,
   /** @type {Perf} */
   perf: { t0: 0, tPlayer: 0, tSegs: 0, tFirstPaint: 0, tFirstTrans: 0, chunkMs: [] },
@@ -208,6 +252,14 @@ async function scrapeTranscriptPanel() {
 }
 
 // ── 3. Worker ────────────────────────────────────────────────────────
+/* 불변식 I10·I11·I12 가 걸리는 지점이다.
+ *  I10  이 fetch 는 반드시 유한 타임아웃을 가진다.
+ *  I11  ★ 현재 위반 중: 아래 `attempt >= 1` 재시도가 워커의 3회 재시도와 곱해져
+ *       청크 하나에 LLM 호출이 최대 6회(≈10분) 발생한다. 재시도는 한 층에만 둔다 —
+ *       여기를 없애고 start() 의 청크 재큐에 맡기거나, 워커 재시도를 1회로 낮춘다.
+ *  I12  타임아웃 값 > 워커 최대 소요. Phase 4 실측 LLM 왕복 70~100초 기준으로
+ *       워커가 3회까지 쓰면 210~300초이므로 그보다 커야 한다.
+ *  I8   signal 은 호출자가 지역 캡처한 것을 받는다. state.abort 를 직접 읽지 않는다. */
 async function requestTranslation(videoId, lang, segments, ctx = {}, signal = null) {
   // TODO(phase6): 요청 1회의 타임아웃을 건다. 내부에 AbortController 를 만들고 전달받은
   //   signal 의 "abort" 이벤트를 addEventListener 로 수동 연결한다. AbortSignal.any() 는
@@ -215,10 +267,10 @@ async function requestTranslation(videoId, lang, segments, ctx = {}, signal = nu
   //   타임아웃이 없으면 멈춘 업스트림 하나가 runner 슬롯을 영구 점유해 처리량이 반토막 난다 (불변식 10).
   for (let attempt = 0; ; attempt++) {
     try {
-      // TODO(phase6): fetch 옵션에 signal 을 넘긴다.
       const res = await fetch(`${cfg.endpoint}/api/subtitle`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        signal,
         body: JSON.stringify({
           videoId,
           lang,
@@ -236,6 +288,7 @@ async function requestTranslation(videoId, lang, segments, ctx = {}, signal = nu
       if (!Array.isArray(lines) || !lines.length) throw new Error("빈 응답");
       return lines;
     } catch (e) {
+      if (signal?.aborted) throw e;        // 세션 종료 — 재시도하지 않는다 (I7)
       if (attempt >= 1) throw e;           // 1회 재시도 후 포기
       await new Promise((r) => setTimeout(r, 1200));
     }
@@ -553,27 +606,42 @@ function positionOverlay() {
 
 /** 번역 전 원문을 state.lines 에 자리표시자(raw)로 깔고 렌더를 시작한다.
  *  번역을 기다리는 동안 화면이 비어 있지 않게 하는 것이 유일한 목적이다.
+ *
+ *  불변식: 이 함수가 I1 을 세운다. 호출된 뒤로는 어떤 코드도 오버레이를 상태
+ *    메시지로 덮어써선 안 된다. 호출 전에는 I1 이 성립하지 않는다.
+ *
  *  @param {Segment[]} segments
  *  @returns {void} */
 function seedRawLines(segments) {
-  // TODO(phase6): segments 를 { start, end, orig: text, trans: "", raw: true } 로 옮겨
-  //   state.lines 에 넣고, state.idx 를 무효화한 뒤 loop() 를 시작한다.
-  //   perf.tFirstPaint 를 여기서 기록한다 (계측 1단계).
-  throw new Error("not implemented");
+  state.lines = segments.map((s) => ({
+    start: s.start, end: s.end, orig: s.text, trans: "", raw: true,
+  }));
+  state.idx = -2;                 // 다음 render 가 다시 계산하게
+  state.perf.tFirstPaint = performance.now() - state.perf.t0;
+  if (!state.rafId) loop();       // 여기서부터 I1 이 성립한다
 }
 
 /** [t0, t1) 구간의 raw 줄을 걷어내고 번역 줄로 갈아끼운다. start 정렬을 유지한다.
  *  t0/t1 은 응답이 아니라 청크에서 온다 — 워커가 일부 줄을 버려도 구간 전체가
  *  확실히 교체되어야 raw 와 번역본이 같은 시각에 겹치지 않는다.
+ *
+ *  불변식 — 이 함수가 반환된 뒤 항상 참이어야 한다:
+ *    I2  state.lines 가 start 오름차순이다.
+ *    I3  raw 줄의 start 가 어떤 번역 줄의 [start, end) 안에 들어가지 않는다.
+ *    I4  제거 대상은 raw 줄뿐이다. 이미 번역된 줄은 건드리지 않는다 (청크가 뒤섞인
+ *        순서로 도착하므로 남의 결과를 지우면 안 된다).
+ *    I5  제거한 구간은 lines 가 반드시 덮는다. 덮지 못하면 빈 시각이 생긴다.
+ *  Phase 4 에서 240조각·5청크·도착순서 뒤섞음·시간겹침 조건으로 실측 통과했다.
+ *
  *  @param {Line[]} lines  워커가 돌려준 번역 줄
  *  @param {number} t0     교체할 구간의 시작(초)
  *  @param {number} t1     교체할 구간의 끝(초)
  *  @returns {void} */
 function mergeTranslated(lines, t0, t1) {
-  // TODO(phase6): state.lines 에서 [t0, t1) 에 걸치는 raw 줄을 전부 제거하고 lines 를 넣은 뒤
-  //   start 오름차순을 복구한다 (불변식 2·3). 이미 번역된 줄(raw 아님)은 건드리지 않는다.
-  //   state.idx 를 무효화해 다음 render 가 다시 계산하게 한다.
-  throw new Error("not implemented");
+  // raw 만 걷어낸다 — 청크는 뒤섞인 순서로 도착하므로 남의 번역 결과를 지우면 안 된다 (I4)
+  const kept = state.lines.filter((l) => !(l.raw && l.start >= t0 && l.start < t1));
+  state.lines = kept.concat(lines).sort((a, b) => a.start - b.start);   // I2
+  state.idx = -2;
 }
 
 function findLine(t) {
@@ -649,11 +717,10 @@ async function start() {
   stop({ keepBox: true });
   state.videoId = videoId;
   state.active = true;
-  // TODO(phase6): state.gen 을 1 올리고 그 값을 지역변수(myGen)로 잡는다. 아래 모든 응답을
-  //   이 세대 번호로 검사해야 같은 영상을 정지 후 재시작했을 때 이전 요청의 응답이
-  //   새 세션에 섞이지 않는다 (불변식 4).
-  // TODO(phase6): state.abort = new AbortController() — 이 세대의 모든 fetch 에 물릴 신호.
-  // TODO(phase6): state.perf 를 초기화하고 perf.t0 = performance.now() 기록 (계측 1단계).
+  const myGen = ++state.gen;                  // I6
+  state.abort = new AbortController();
+  const sig = state.abort.signal;             // I8: 지역 캡처 (stop() 이 state.abort 를 비운다)
+  state.perf = { t0: performance.now(), tPlayer: 0, tSegs: 0, tFirstPaint: 0, tFirstTrans: 0, chunkMs: [] };
   syncBar();
 
   try {
@@ -663,7 +730,7 @@ async function start() {
     //   만들지 않는다 (호출자가 하나뿐). 같은 페이지 HTML 을 네트워크로 다시 받는 낭비 제거.
     //   단 Phase 4 에서 perf.tPlayer 가 1초 미만이면 이 항목은 통째로 버린다.
     const player = await fetchPlayerResponse(videoId);
-    // TODO(phase6): perf.tPlayer 기록 (계측 1단계).
+    state.perf.tPlayer = performance.now() - state.perf.t0;
     state.title = player?.videoDetails?.title || document.title;
 
     // 라이브는 완결된 자막 트랙이 없다 → 바로 Whisper 전사 모드
@@ -682,10 +749,8 @@ async function start() {
     // 트랙이 없거나 두 경로 모두 막힘 → Whisper 전사 모드
     if (!segments.length) { startAsr(); return; }
 
-    // TODO(phase6): perf.tSegs 기록 (계측 1단계).
-    // TODO(phase6): seedRawLines(segments) 호출 — 원문을 raw 줄로 즉시 깔고 렌더를 시작한다.
-    //   "첫 자막까지 오래 걸린다"의 핵심 해결책이며, 이 시점 이후로는 화면에 자막이
-    //   비어 있으면 안 된다 (불변식 1).
+    state.perf.tSegs = performance.now() - state.perf.t0;
+    seedRawLines(segments);        // I1: 이 시점부터 화면은 비지 않는다
 
     // 긴 자막을 한 요청으로 보내면 응답까지 몇 분씩 걸려 연결이 끊긴다.
     // 작은 청크로 나눠, "지금 보고 있는 지점" 주변부터 우선 번역해 바로 띄우고
@@ -694,10 +759,8 @@ async function start() {
     const CTX_N = 8;
     const chunks = [];
     for (let i = 0; i < segments.length; i += TRANSLATE_CHUNK) {
-      // TODO(phase6): t0/t1 도 함께 넣는다 — t0 = 첫 seg 의 start, t1 = 마지막 seg 의 end.
-      //   mergeTranslated 가 raw 를 걷어낼 구간의 권위 있는 경계다. 워커가 빈 줄을 버리므로
-      //   응답에서 유도하면 구간이 좁아져 가장자리 raw 가 살아남는다 (불변식 3).
-      chunks.push({ i0: i, segs: segments.slice(i, i + TRANSLATE_CHUNK) });
+      const segs = segments.slice(i, i + TRANSLATE_CHUNK);
+      chunks.push({ i0: i, segs, t0: segs[0].start, t1: segs[segs.length - 1].end });
     }
     // 우선순위는 고정 순서가 아니라 "매 청크마다" 현재 재생바 위치로 다시
     // 고른다 — 시킹해도 다음 요청부터 그 지점이 최우선이 된다.
@@ -715,59 +778,47 @@ async function start() {
       return best;
     };
 
-    // TODO(phase6): 이 showStatus 를 제거한다. seedRawLines 이후에는 원문 자막이 이미 떠
-    //   있는데 여기서 오버레이를 "⏳ 번역 중" 으로 덮어써 버린다 (불변식 1 위반).
-    //   진행 상황을 알리려면 자막을 가리지 않는 수단(하단 바 라벨 등)을 쓴다.
-    showStatus(`번역 중 (${segments.length}줄)`, true);
-    // TODO(phase6): 실패 청크를 1회 한정으로 pending 에 되돌리기 위한 재시도 기록
-    //   (Set<Chunk>)을 여기 둔다. 지금은 실패한 청크가 영구히 버려져 그 구간이 영영
-    //   번역되지 않는다 — 사용자에겐 "느리다"로 보인다 (불변식 8).
+    // showStatus 없음 — 원문이 이미 떠 있는데 덮어쓰면 I1 위반
     let done = 0, failed = 0;
+    const retried = new Set();     // 청크당 재큐 1회 한정 (I5)
     const runner = async () => {
       for (;;) {
-        // TODO(phase6): 이 가드를 state.gen !== myGen 검사로 바꾼다. videoId 비교는
-        //   같은 영상을 정지 후 재시작한 경우를 못 잡는다 (불변식 4).
-        if (state.videoId !== videoId || !state.active) return;
+        if (state.gen !== myGen || !state.active) return;   // I6
         const c = nextChunk();
         if (!c) return;
         pending.delete(c);
+        const tReq = performance.now();
         try {
-          // TODO(phase6): 요청 직전/직후 performance.now() 를 재서 perf.chunkMs 에 넣는다 (계측 1단계).
-          // TODO(phase6): 5번째 인자로 state.abort.signal 을 넘긴다.
           const lines = await requestTranslation(videoId, track.languageCode, c.segs, {
             before: segments.slice(Math.max(0, c.i0 - CTX_N), c.i0).map((s) => s.text),
             after: segments.slice(c.i0 + c.segs.length, c.i0 + c.segs.length + CTX_N).map((s) => s.text),
-          });
-          // TODO(phase6): 이 가드도 state.gen !== myGen 로 (불변식 4).
-          if (state.videoId !== videoId || !state.active) return;
-          // TODO(phase6): concat+sort 를 mergeTranslated(lines, c.t0, c.t1) 로 교체한다.
-          //   지금은 번역 줄을 "추가"만 하므로, raw 줄을 깔기 시작하면 같은 시각에 원문 줄과
-          //   번역 줄이 둘 다 남아 자막이 겹쳐 보인다 (불변식 3).
-          state.lines = state.lines.concat(lines).sort((a, b) => a.start - b.start);
-          state.idx = -2;
-          // TODO(phase6): 이 loop() 시동을 삭제한다 — seedRawLines 가 이미 렌더를 돌리고 있다.
-          if (!state.rafId) loop();      // 첫 청크 도착 즉시 표시 시작
-          // TODO(phase6): 첫 번역 도착이면 perf.tFirstTrans 기록 (계측 1단계).
+          }, sig);
+          if (state.gen !== myGen || !state.active) return;   // I6
+          state.perf.chunkMs.push(Math.round(performance.now() - tReq));
+          mergeTranslated(lines, c.t0, c.t1);                 // I2·I3·I4
+          if (!state.perf.tFirstTrans) state.perf.tFirstTrans = performance.now() - state.perf.t0;
           log(`번역 ${++done}/${chunks.length} 청크 (${state.lines.length}줄)`);
         } catch (e) {
-          // TODO(phase6): abort 로 인한 실패는 실패로 세지 말고 조용히 return 한다.
-          // TODO(phase6): 아직 재시도한 적 없는 청크면 pending 에 다시 넣는다 (1회 한정).
-          //   되돌리지 않으면 그 구간은 raw 원문 상태로 영구히 남는다 (불변식 8).
+          if (sig.aborted || state.gen !== myGen) return;     // 세션 종료는 실패가 아니다
+          if (!retried.has(c)) { retried.add(c); pending.add(c); continue; }
           failed++;
           log(`번역 청크 실패 (${failed}번째)`, e.message);
         }
       }
     };
-    // TODO(phase6): runner 개수를 Phase 4 측정 1(동시성 프로브) 결과로 정한다.
-    //   업스트림(127.0.0.1:8317)이 직렬 처리로 나오면 이 항목은 폐기하고 2 를 유지한다.
-    await Promise.all([runner(), runner()]);   // 2개 동시 — 따라잡기 빠르게
-    // TODO(phase6): 이 가드도 state.gen !== myGen 로 (불변식 4).
-    if (state.videoId !== videoId || !state.active) return;
-    // TODO(phase6): seedRawLines 이후 state.lines 는 절대 비지 않으므로 이 throw 는 도달
-    //   불가가 된다. "전부 실패" 판정을 done === 0 기준으로 바꾼다.
-    if (!state.lines.length) throw new Error("번역 실패");
+    // Phase 4 실측: 업스트림은 동시 8까지 거의 선형 (1개 73s / 4개 69s / 8개 84s, 실패 0). I13
+    const RUNNERS = 8;
+    await Promise.all(Array.from({ length: RUNNERS }, runner));
+    if (state.gen !== myGen || !state.active) return;   // I6
+    if (!done) throw new Error("번역 실패");             // lines 는 raw 로 항상 차 있다 (I1)
     if (failed) toast(`번역 ${failed}개 청크 실패`);
-    log(`준비 완료: ${state.lines.length}줄`);
+    const p = state.perf;
+    log(`준비 완료: ${state.lines.length}줄`, {
+      tPlayer: Math.round(p.tPlayer), tSegs: Math.round(p.tSegs),
+      tFirstPaint: Math.round(p.tFirstPaint), tFirstTrans: Math.round(p.tFirstTrans),
+      chunkMedian: p.chunkMs.slice().sort((a, b) => a - b)[p.chunkMs.length >> 1],
+      tAllDone: Math.round(performance.now() - p.t0), chunks: chunks.length, failed,
+    });
   } catch (e) {
     console.error("[YT Dual]", e);
     showStatus(`오류: ${e.message}`);
@@ -779,10 +830,9 @@ async function start() {
 function stop({ keepBox = false } = {}) {
   stopAsr();
   if (state.rafId) cancelAnimationFrame(state.rafId);
-  // TODO(phase6): state.abort?.abort() 로 진행 중인 요청을 실제로 끊고 state.abort = null.
-  //   지금은 정지·영상 이동 후에도 fetch 가 살아남아 runner 슬롯을 계속 물고 있다 (불변식 7).
-  // TODO(phase6): state.gen 을 올려 이 세대의 남은 응답을 무효화한다 (불변식 4).
-  Object.assign(state, { rafId: null, lines: [], idx: -1, loop: false, active: false });
+  state.abort?.abort();   // I7: 진행 중인 요청을 실제로 끊는다
+  state.gen++;            // I6: 이 세대의 남은 응답을 무효화
+  Object.assign(state, { rafId: null, lines: [], idx: -1, loop: false, active: false, abort: null });
   syncBar();
   if (!keepBox) $("#ytdual-box")?.remove();
 }
