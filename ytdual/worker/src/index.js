@@ -1,16 +1,17 @@
 /**
  * YT Dual Worker v2
  *
- *  POST /api/subtitle   자막 재분할 + 번역 (KV 캐시)
- *  POST /api/cards      폰에서 저장한 카드 쌓기
- *  GET  /api/cards      PC에서 대기 중인 카드 가져오기
- *  POST /api/cards/ack  Anki 반영 끝난 카드 비우기
+ *  POST /api/subtitle    자막 재분할 + 번역 (KV 캐시)
+ *  POST /api/transcribe  오디오 청크 → Groq Whisper 전사 (자막 트랙 없는 영상용)
+ *  POST /api/cards       폰에서 저장한 카드 쌓기
+ *  GET  /api/cards       PC에서 대기 중인 카드 가져오기
+ *  POST /api/cards/ack   Anki 반영 끝난 카드 비우기
  *
  * 확장이 자막을 직접 가져오므로 Worker는 유튜브에 접속하지 않습니다.
  */
 
 const LLM_MODEL = "gpt-5.6-luna";
-const LLM_URL = "https://api.openai.com/v1/chat/completions";
+const DEFAULT_LLM_URL = "https://api.openai.com/v1/chat/completions";
 const REASONING = "low";     // 번역은 추론이 거의 필요 없음. none 도 가능
 const BATCH = 200;           // 컨텍스트 1.05M 이라 넉넉히. 문맥이 클수록 번역 품질↑
 const CONCURRENCY = 3;
@@ -34,6 +35,7 @@ const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type",
+  "Access-Control-Allow-Private-Network": "true",   // Chrome PNA: https 페이지 → localhost dev worker
   "Access-Control-Max-Age": "86400",
 };
 
@@ -56,7 +58,7 @@ async function translateBatch(env, batch, target) {
 
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      const res = await fetch(LLM_URL, {
+      const res = await fetch(env.LLM_URL || DEFAULT_LLM_URL, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${env.OPENAI_API_KEY}`,
@@ -171,6 +173,52 @@ async function handleSubtitle(request, env, ctx) {
   return json({ lines, cached: false, degraded: degraded > 0 });
 }
 
+// ── 전사 (자막 트랙 없는 영상 → Groq Whisper) ────────────────────────
+const ASR_MODEL = "whisper-large-v3";
+const ASR_URL = "https://api.groq.com/openai/v1/audio/transcriptions";
+const MAX_AUDIO_BYTES = 20 * 1024 * 1024;
+
+async function handleTranscribe(request, env) {
+  if (!env.GROQ_API_KEY) return json({ error: "GROQ_API_KEY 미설정" }, 500);
+
+  let form;
+  try { form = await request.formData(); } catch { return json({ error: "multipart form 필요" }, 400); }
+
+  const file = form.get("file");
+  if (!file || typeof file === "string") return json({ error: "file 필드 필요" }, 400);
+  if (file.size > MAX_AUDIO_BYTES) return json({ error: `오디오가 너무 큽니다 (${file.size}B)` }, 413);
+
+  const out = new FormData();
+  out.append("file", file, file.name || "chunk.webm");
+  out.append("model", ASR_MODEL);
+  out.append("response_format", "verbose_json");
+  const lang = form.get("language");
+  if (lang && typeof lang === "string" && /^[a-z]{2}$/.test(lang)) out.append("language", lang);
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const res = await fetch(ASR_URL, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${env.GROQ_API_KEY}` },
+      body: out,
+    });
+    if (res.status === 429 || res.status >= 500) { await sleep(500 * 2 ** attempt); continue; }
+    if (!res.ok) {
+      const detail = await res.text().catch(() => "");
+      return json({ error: `groq ${res.status} ${detail.slice(0, 200)}` }, 502);
+    }
+    const data = await res.json();
+    const segments = (data.segments || [])
+      .map((s) => ({
+        start: Number(s.start) || 0,
+        end: Number(s.end) || 0,
+        text: String(s.text || "").trim(),
+      }))
+      .filter((s) => s.text);
+    return json({ segments });
+  }
+  return json({ error: "groq 재시도 초과" }, 502);
+}
+
 // ── 카드 큐 (폰에서 저장 → PC 에서 Anki 로) ──────────────────────────
 const cardsKey = (uid) => `cards:${uid}`;
 
@@ -248,6 +296,7 @@ export default {
 
     if (p === "/") return new Response("YT Dual worker v2 ok", { headers: CORS });
     if (p === "/api/subtitle" && m === "POST") return handleSubtitle(request, env, ctx);
+    if (p === "/api/transcribe" && m === "POST") return handleTranscribe(request, env);
     if (p === "/api/cards" && m === "GET") return handleCardsGet(url, env);
     if (p === "/api/cards" && m === "POST") return handleCardsPost(request, env);
     if (p === "/api/cards/ack" && m === "POST") return handleCardsAck(request, env);

@@ -31,6 +31,7 @@ let state = {
   rafId: null,
   queue: [],      // 아직 Worker 로 못 보낸 카드
   flushing: false,
+  asr: null,      // 전사 모드 세션 (자막 트랙 없는 영상)
 };
 
 const $ = (s, r = document) => r.querySelector(s);
@@ -94,7 +95,10 @@ async function fetchSegments(track) {
   url.searchParams.set("fmt", "json3");
   const res = await fetch(url.toString(), { credentials: "include" });
   if (!res.ok) throw new Error(`자막 트랙 ${res.status}`);
-  const data = await res.json();
+  // 2024년부터 pot(PoToken) 없는 요청에 200 + 빈 본문을 주는 경우가 있다
+  const body = await res.text();
+  if (!body.trim()) return [];
+  const data = JSON.parse(body);
 
   return (data.events || [])
     .filter((e) => e.segs)
@@ -104,6 +108,53 @@ async function fetchSegments(track) {
       text: e.segs.map((s) => s.utf8).join("").replace(/\s+/g, " ").trim(),
     }))
     .filter((s) => s.text);
+}
+
+/** timedtext 가 막혔을 때: 유튜브 자체 스크립트 패널을 열어 DOM 에서 긁는다.
+ *  (get_transcript API 는 2026 현재 protobuf 전용 get_panel 로 바뀌어 재현 불가.
+ *   패널은 잠깐 열렸다 닫힌다. 데스크톱 전용 — 모바일은 전사 모드로 넘어간다.) */
+function parseTimestamp(t) {
+  const p = t.trim().split(":").map(Number);
+  if (p.some(isNaN)) return null;
+  return p.length === 3 ? p[0] * 3600 + p[1] * 60 + p[2] : p[0] * 60 + (p[1] || 0);
+}
+
+async function scrapeTranscriptPanel() {
+  const wasOpen = !!$("transcript-segment-view-model, ytd-transcript-segment-renderer");
+  if (!wasOpen) {
+    const expand = $("tp-yt-paper-button#expand, #description-inline-expander #expand");
+    if (expand) { expand.click(); await new Promise((r) => setTimeout(r, 500)); }
+    const btn = $("ytd-video-description-transcript-section-renderer button");
+    if (!btn) return [];                   // 자막 없는 영상엔 버튼 자체가 없다
+    btn.click();
+  }
+
+  let nodes = [];
+  for (let i = 0; i < 40 && !nodes.length; i++) {
+    await new Promise((r) => setTimeout(r, 250));
+    nodes = [...document.querySelectorAll("transcript-segment-view-model, ytd-transcript-segment-renderer")];
+  }
+
+  const video = $("video");
+  const dur = video && isFinite(video.duration) ? video.duration : null;
+  const segments = [];
+  for (const n of nodes) {
+    const tsEl = n.querySelector(".ytwTranscriptSegmentViewModelTimestamp, .segment-timestamp");
+    const txtEl = n.querySelector("span.ytAttributedStringHost, .segment-text, yt-formatted-string.segment-text");
+    if (!tsEl || !txtEl) continue;
+    const start = parseTimestamp(tsEl.textContent);
+    const text = txtEl.textContent.replace(/\s+/g, " ").trim();
+    if (start == null || !text) continue;
+    segments.push({ start, end: 0, text });
+  }
+  for (let i = 0; i < segments.length; i++) {
+    segments[i].end = i + 1 < segments.length ? segments[i + 1].start : dur || segments[i].start + 8;
+  }
+
+  if (!wasOpen) {
+    $('ytd-engagement-panel-section-list-renderer[visibility="ENGAGEMENT_PANEL_VISIBILITY_EXPANDED"] #visibility-button button')?.click();
+  }
+  return segments;
 }
 
 // ── 3. Worker ────────────────────────────────────────────────────────
@@ -120,6 +171,128 @@ async function requestTranslation(videoId, lang, segments) {
   const { lines } = await res.json();
   if (!Array.isArray(lines) || !lines.length) throw new Error("빈 응답");
   return lines;
+}
+
+// ── 전사 모드 (자막 트랙 없는 영상 → Worker → Groq Whisper) ──────────
+const ASR_CHUNK_MS = 45000;
+
+// 요소당 MediaElementSource 는 1개만 만들 수 있고, 한 번 만들면 오디오가
+// 영구히 이 컨텍스트를 경유한다. ctx 를 닫으면 영상이 무음이 되므로
+// 절대 닫지 말고 재사용한다.
+const audioTaps = new WeakMap();
+function tapAudio(video) {
+  let t = audioTaps.get(video);
+  if (!t) {
+    const ctx = new AudioContext();
+    const src = ctx.createMediaElementSource(video);
+    src.connect(ctx.destination);          // 소리는 계속 스피커로
+    t = { ctx, src };
+    audioTaps.set(video, t);
+  }
+  if (t.ctx.state === "suspended") t.ctx.resume().catch(() => {});
+  return t;
+}
+
+async function transcribeChunk(blob, chunkStart, rate) {
+  const form = new FormData();
+  form.append("file", blob, "chunk.webm");
+  if (/^[a-z]{2}$/.test(cfg.prefer)) form.append("language", cfg.prefer);
+  const res = await fetch(`${cfg.endpoint}/api/transcribe`, { method: "POST", body: form });
+  if (!res.ok) throw new Error(`전사 ${res.status}`);
+  const { segments } = await res.json();
+  return (segments || []).map((s) => ({
+    start: chunkStart + s.start * rate,
+    end: chunkStart + s.end * rate,
+    text: s.text,
+  }));
+}
+
+async function appendAsrLines(segments) {
+  if (!segments.length) return;
+  let lines;
+  try {
+    lines = await requestTranslation(`${state.videoId}#asr`, cfg.prefer || "auto", segments);
+  } catch (e) {
+    log("전사분 번역 실패, 원문만 표시", e.message);
+    lines = segments.map((s) => ({ start: s.start, end: s.end, orig: s.text, trans: "" }));
+  }
+  state.lines = state.lines.concat(lines).sort((a, b) => a.start - b.start);
+  state.idx = -2;                          // 다음 render 에서 다시 그리게
+}
+
+function startAsr() {
+  const video = $("video");
+  if (!video) { showStatus("영상 요소를 찾지 못했습니다"); return; }
+  if (!window.MediaRecorder || !window.AudioContext) {
+    showStatus("이 브라우저는 전사 모드를 지원하지 않습니다");
+    return;
+  }
+
+  const tap = tapAudio(video);
+  const dest = tap.ctx.createMediaStreamDestination();
+  tap.src.connect(dest);
+
+  const mime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+    ? "audio/webm;codecs=opus"
+    : MediaRecorder.isTypeSupported("audio/ogg;codecs=opus")
+      ? "audio/ogg;codecs=opus"
+      : "";
+
+  const a = (state.asr = { tap, dest, recorder: null, timer: null });
+
+  // 청크마다 recorder 를 새로 만든다 — timeslice 조각과 달리 각 파일이 독립 재생 가능해야 Whisper 가 받는다
+  const cycle = () => {
+    if (state.asr !== a) return;
+    const rec = new MediaRecorder(dest.stream, mime ? { mimeType: mime } : undefined);
+    a.recorder = rec;
+    const chunkStart = video.currentTime;
+    const rate = video.playbackRate;
+    rec.addEventListener("dataavailable", async (e) => {
+      if (state.asr !== a || e.data.size < 2000) return;   // 중지됐거나 무음 청크
+      try {
+        await appendAsrLines(await transcribeChunk(e.data, chunkStart, rate));
+      } catch (err) {
+        log("전사 실패", err.message);
+      }
+    });
+    rec.start();
+    a.timer = setTimeout(rotate, ASR_CHUNK_MS);
+  };
+  const rotate = () => {
+    if (state.asr !== a) return;
+    clearTimeout(a.timer);
+    if (a.recorder && a.recorder.state !== "inactive") a.recorder.stop();
+    cycle();
+  };
+
+  // 일시정지 중 무음이 녹음되지 않게, 탐색하면 청크를 끊어 타임스탬프를 지키게
+  video.addEventListener("pause", (a.onPause = () => {
+    if (a.recorder?.state === "recording") a.recorder.pause();
+  }));
+  video.addEventListener("play", (a.onPlay = () => {
+    if (tap.ctx.state === "suspended") tap.ctx.resume().catch(() => {});
+    if (a.recorder?.state === "paused") a.recorder.resume();
+  }));
+  video.addEventListener("seeked", (a.onSeek = rotate));
+  video.addEventListener("ended", (a.onEnded = rotate));   // 마지막 부분 청크 즉시 전사
+  a.video = video;
+
+  showStatus("자막 트랙 없음 → Whisper 전사 모드. 재생하면 자막이 따라옵니다");
+  if (!state.rafId) loop();
+  cycle();
+}
+
+function stopAsr() {
+  const a = state.asr;
+  if (!a) return;
+  state.asr = null;                        // dataavailable 가드가 이걸 본다
+  clearTimeout(a.timer);
+  if (a.recorder && a.recorder.state !== "inactive") a.recorder.stop();
+  a.video?.removeEventListener("pause", a.onPause);
+  a.video?.removeEventListener("play", a.onPlay);
+  a.video?.removeEventListener("seeked", a.onSeek);
+  a.video?.removeEventListener("ended", a.onEnded);
+  try { a.tap.src.disconnect(a.dest); } catch {}   // 스피커 연결은 유지
 }
 
 // ── 카드 저장 ────────────────────────────────────────────────────────
@@ -195,6 +368,13 @@ function ensureOverlay() {
   });
 
   document.body.appendChild(box);
+
+  // 플레이어 크기 변화(시어터 모드, 창 조절)를 따라가게 — rAF 루프가 안 도는
+  // 상태 메시지 화면에서도 위치가 갱신되도록 video 를 직접 관찰한다
+  const video = $("video");
+  if (video && window.ResizeObserver) {
+    new ResizeObserver(positionOverlay).observe(video);
+  }
   return box;
 }
 
@@ -289,11 +469,17 @@ async function start() {
     state.title = player?.videoDetails?.title || document.title;
 
     const track = pickTrack(player);
-    if (!track) { showStatus("이 영상에는 자막 트랙이 없습니다"); return; }
-
-    showStatus("자막 불러오는 중", true);
-    const segments = await fetchSegments(track);
-    if (!segments.length) { showStatus("자막이 비어 있습니다"); return; }
+    let segments = [];
+    if (track) {
+      showStatus("자막 불러오는 중", true);
+      segments = await fetchSegments(track).catch((e) => (log("timedtext 실패", e.message), []));
+      if (!segments.length) {
+        log("timedtext 빈 응답 → 스크립트 패널에서 수집");
+        segments = await scrapeTranscriptPanel().catch((e) => (log("패널 수집 실패", e.message), []));
+      }
+    }
+    // 트랙이 없거나 두 경로 모두 막힘 → Whisper 전사 모드
+    if (!segments.length) { startAsr(); return; }
 
     showStatus(`번역 중 (${segments.length}줄)`, true);
     state.lines = await requestTranslation(videoId, track.languageCode, segments);
@@ -309,6 +495,7 @@ async function start() {
 }
 
 function stop({ keepBox = false } = {}) {
+  stopAsr();
   if (state.rafId) cancelAnimationFrame(state.rafId);
   Object.assign(state, { rafId: null, lines: [], idx: -1, loop: false, active: false });
   if (!keepBox) $("#ytdual-box")?.remove();

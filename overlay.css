@@ -1,0 +1,16 @@
+.trancy-overlay {
+  position: absolute;
+  bottom: 12%;
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: 80%;
+  padding: 4px 12px;
+  background: rgba(0, 0, 0, 0.75);
+  color: #ffd54f;
+  font-size: 18px;
+  line-height: 1.4;
+  text-align: center;
+  border-radius: 4px;
+  z-index: 60;
+  pointer-events: none;
+}

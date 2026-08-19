@@ -42,6 +42,8 @@ build_trancy/
 2. YouTube DOM은 읽기만; 쓰는 곳은 우리 오버레이뿐
 3. Session 1에서 네트워크 요청 0건, 저장소 사용 0건
 4. 확장 오류가 페이지를 깨뜨리지 않음
+5. MutationObserver는 문서당 1개, 안정 루트(body)에 부착 — 플레이어 노드에
+   붙이면 SPA 네비게이션 시 죽는다 (Phase 4 실측)
 
 ### 구현 순서 (Phase 6)
 
