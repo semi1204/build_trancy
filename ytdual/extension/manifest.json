@@ -1,0 +1,37 @@
+{
+  "manifest_version": 3,
+  "name": "YT Dual",
+  "version": "0.2.0",
+  "description": "유튜브 이중 자막 + Anki 문장 카드. 자막은 브라우저가 직접 가져오고 번역만 내 Worker가 처리합니다.",
+
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "ytdual@example.com",
+      "strict_min_version": "115.0"
+    }
+  },
+
+  "permissions": ["storage"],
+
+  "host_permissions": [
+    "https://www.youtube.com/*",
+    "https://sub.example.workers.dev/*",
+    "http://127.0.0.1:8765/*",
+    "http://localhost:8765/*"
+  ],
+
+  "content_scripts": [
+    {
+      "matches": ["https://www.youtube.com/*", "https://m.youtube.com/*"],
+      "js": ["content.js"],
+      "css": ["overlay.css"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  }
+}

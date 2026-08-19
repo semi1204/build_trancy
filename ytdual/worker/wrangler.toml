@@ -1,0 +1,14 @@
+name = "ytdual"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+
+# 캐시용 KV. 아래 명령으로 만들고 id 를 채우세요:
+#   npx wrangler kv namespace create SUBS
+[[kv_namespaces]]
+binding = "SUBS"
+id = "여기에_KV_ID_붙여넣기"
+
+# 본인 도메인에 붙이려면 주석 해제 (Cloudflare에 이미 등록된 도메인이어야 함)
+# [[routes]]
+# pattern = "sub.내도메인.com"
+# custom_domain = true
