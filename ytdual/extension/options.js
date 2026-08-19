@@ -6,9 +6,11 @@ const DEFAULTS = {
   showOriginal: true,
   showTranslation: true,
   autoStart: true,
+  origColor: "#ffffff",
+  transColor: "#ffe27a",
 };
 
-const TEXT = ["endpoint", "target", "prefer"];
+const TEXT = ["endpoint", "target", "prefer", "origColor", "transColor"];
 const NUM = ["fontSize"];
 const BOOL = ["showOriginal", "showTranslation", "autoStart"];
 

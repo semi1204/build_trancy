@@ -29,6 +29,13 @@
       "css": ["overlay.css"],
       "run_at": "document_idle",
       "all_frames": false
+    },
+    {
+      "matches": ["<all_urls>"],
+      "exclude_matches": ["https://www.youtube.com/*", "https://m.youtube.com/*"],
+      "js": ["page.js"],
+      "run_at": "document_idle",
+      "all_frames": false
     }
   ],
 

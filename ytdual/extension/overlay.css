@@ -16,18 +16,18 @@
 #ytdual-box.empty { opacity: 0; }
 
 #ytdual-orig {
-  color: #fff;
+  color: var(--ytdual-orig-color, #fff);
   font-weight: 600;
 }
 
 #ytdual-trans {
-  color: #ffe27a;
+  color: var(--ytdual-trans-color, #ffe27a);
   font-size: .88em;
   margin-top: .15em;
 }
 
 #ytdual-box.looping #ytdual-orig {
-  border-bottom: 2px solid #ffe27a;
+  border-bottom: 2px solid var(--ytdual-trans-color, #ffe27a);
   display: inline-block;
   padding-bottom: 2px;
 }
@@ -66,6 +66,39 @@
 .ytdual-w:active { background: rgba(255, 226, 122, .5); }
 .ytdual-w.saved  { background: rgba(255, 226, 122, .22);
                    box-shadow: inset 0 -2px 0 #ffe27a; }
+
+/* 단어 팝업 */
+#ytdual-pop {
+  position: fixed;
+  z-index: 2147483003;
+  min-width: 180px;
+  max-width: 320px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  background: rgba(18, 18, 18, .96);
+  color: #fff;
+  font: 14px/1.45 system-ui, -apple-system, "Noto Sans KR", sans-serif;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, .5);
+  text-shadow: none;
+  text-align: left;
+  pointer-events: auto;
+}
+
+#ytdual-pop-word { font-weight: 700; font-size: 15px; margin-bottom: 4px; }
+#ytdual-pop-meaning { color: #ffe27a; font-weight: 600; }
+#ytdual-pop-base { color: #bbb; font-size: 12.5px; margin-top: 3px; }
+#ytdual-pop-actions { margin-top: 10px; display: flex; gap: 8px; }
+
+#ytdual-pop-actions button {
+  border: none;
+  border-radius: 7px;
+  padding: 7px 10px;
+  font: 600 12.5px/1 system-ui, sans-serif;
+  cursor: pointer;
+}
+
+#ytdual-pop-save { background: #ffe27a; color: #222; }
+#ytdual-pop-close { background: rgba(255, 255, 255, .12); color: #ddd; }
 
 #ytdual-toast {
   position: fixed;

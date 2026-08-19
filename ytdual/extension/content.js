@@ -17,6 +17,8 @@ const DEFAULTS = {
   showOriginal: true,
   showTranslation: true,
   autoStart: true,
+  origColor: "#ffffff",
+  transColor: "#ffe27a",
   uid: "",
 };
 
@@ -158,19 +160,33 @@ async function scrapeTranscriptPanel() {
 }
 
 // ── 3. Worker ────────────────────────────────────────────────────────
-async function requestTranslation(videoId, lang, segments) {
-  const res = await fetch(`${cfg.endpoint}/api/subtitle`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ videoId, lang, target: cfg.target, segments }),
-  });
-  if (!res.ok) {
-    const detail = await res.text().catch(() => "");
-    throw new Error(`서버 ${res.status} ${detail.slice(0, 120)}`);
+async function requestTranslation(videoId, lang, segments, ctx = {}) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const res = await fetch(`${cfg.endpoint}/api/subtitle`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          videoId,
+          lang,
+          target: cfg.target,
+          segments,
+          ctxBefore: ctx.before || [],   // 청크 경계에서도 번역이 이어지게
+          ctxAfter: ctx.after || [],
+        }),
+      });
+      if (!res.ok) {
+        const detail = await res.text().catch(() => "");
+        throw new Error(`서버 ${res.status} ${detail.slice(0, 120)}`);
+      }
+      const { lines } = await res.json();
+      if (!Array.isArray(lines) || !lines.length) throw new Error("빈 응답");
+      return lines;
+    } catch (e) {
+      if (attempt >= 1) throw e;           // 1회 재시도 후 포기
+      await new Promise((r) => setTimeout(r, 1200));
+    }
   }
-  const { lines } = await res.json();
-  if (!Array.isArray(lines) || !lines.length) throw new Error("빈 응답");
-  return lines;
 }
 
 // ── 전사 모드 (자막 트랙 없는 영상 → Worker → Groq Whisper) ──────────
@@ -211,7 +227,9 @@ async function appendAsrLines(segments) {
   if (!segments.length) return;
   let lines;
   try {
-    lines = await requestTranslation(`${state.videoId}#asr`, cfg.prefer || "auto", segments);
+    lines = await requestTranslation(`${state.videoId}#asr`, cfg.prefer || "auto", segments, {
+      before: state.lines.slice(-8).map((l) => l.orig),   // 직전 자막을 문맥으로
+    });
   } catch (e) {
     log("전사분 번역 실패, 원문만 표시", e.message);
     lines = segments.map((s) => ({ start: s.start, end: s.end, orig: s.text, trans: "" }));
@@ -335,6 +353,83 @@ function saveCard(word) {
   flushQueue();
 }
 
+// ── 단어 팝업 (클릭 → 문맥상 뜻 → 추가 액션으로 저장) ────────────────
+let popEl = null;
+let popResume = false;
+
+function closeWordPop() {
+  if (!popEl) return;
+  popEl.remove();
+  popEl = null;
+  if (popResume) {
+    $("video")?.play();
+    popResume = false;
+  }
+}
+
+async function openWordPop(wEl) {
+  const word = wEl.dataset.word;
+  const line = state.lines[state.idx];
+  const sentence = line ? line.orig : "";
+  closeWordPop();
+
+  const video = $("video");
+  if (video && !video.paused) { video.pause(); popResume = true; }   // 읽는 동안 정지
+
+  popEl = document.createElement("div");
+  popEl.id = "ytdual-pop";
+  popEl.innerHTML = `
+    <div id="ytdual-pop-word"></div>
+    <div id="ytdual-pop-meaning">⏳ 뜻 찾는 중…</div>
+    <div id="ytdual-pop-base"></div>
+    <div id="ytdual-pop-actions">
+      <button id="ytdual-pop-save">문장과 함께 저장</button>
+      <button id="ytdual-pop-close">닫기</button>
+    </div>`;
+  popEl.querySelector("#ytdual-pop-word").textContent = word;
+  popEl.addEventListener("click", (e) => e.stopPropagation());
+  popEl.querySelector("#ytdual-pop-save").addEventListener("click", () => {
+    saveCard(word);
+    wEl.classList.add("saved");
+    closeWordPop();
+  });
+  popEl.querySelector("#ytdual-pop-close").addEventListener("click", closeWordPop);
+  document.body.appendChild(popEl);
+
+  const place = () => {
+    const r = wEl.getBoundingClientRect();
+    popEl.style.left =
+      Math.max(8, Math.min(window.innerWidth - popEl.offsetWidth - 8, r.left + r.width / 2 - popEl.offsetWidth / 2)) + "px";
+    popEl.style.top = Math.max(8, r.top - popEl.offsetHeight - 10) + "px";
+  };
+  place();
+
+  try {
+    const res = await fetch(`${cfg.endpoint}/api/word`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ word, sentence, target: cfg.target }),
+    });
+    if (!res.ok) throw new Error(String(res.status));
+    const d = await res.json();
+    if (!popEl) return;                    // 그 사이에 닫힘
+    popEl.querySelector("#ytdual-pop-meaning").textContent = d.meaning || "—";
+    popEl.querySelector("#ytdual-pop-base").textContent = d.base || "";
+    place();                               // 내용이 늘었을 수 있으니 재배치
+  } catch (e) {
+    if (popEl) popEl.querySelector("#ytdual-pop-meaning").textContent = "사전 요청 실패";
+  }
+}
+
+// 팝업 밖 클릭 → 닫기
+document.addEventListener(
+  "click",
+  (e) => {
+    if (popEl && !e.target.closest("#ytdual-pop") && !e.target.closest(".ytdual-w")) closeWordPop();
+  },
+  true
+);
+
 let toastTimer = null;
 function toast(msg) {
   let t = $("#ytdual-toast");
@@ -350,6 +445,14 @@ function toast(msg) {
 }
 
 // ── 4. 오버레이 ──────────────────────────────────────────────────────
+/** 설정된 자막 색을 CSS 변수로 반영 (overlay.css 가 읽는다) */
+function applyColors() {
+  const box = $("#ytdual-box");
+  if (!box) return;
+  box.style.setProperty("--ytdual-orig-color", cfg.origColor);
+  box.style.setProperty("--ytdual-trans-color", cfg.transColor);
+}
+
 function ensureOverlay() {
   let box = $("#ytdual-box");
   if (box) return box;
@@ -357,14 +460,13 @@ function ensureOverlay() {
   box.id = "ytdual-box";
   box.innerHTML = `<div id="ytdual-orig"></div><div id="ytdual-trans"></div>`;
 
-  // 단어 탭 → 카드 저장
+  // 단어 탭 → 문맥상 뜻 팝업 (저장은 팝업 안의 버튼으로)
   box.addEventListener("click", (e) => {
     const w = e.target.closest(".ytdual-w");
     if (!w) return;
     e.preventDefault();
     e.stopPropagation();
-    saveCard(w.dataset.word);
-    w.classList.add("saved");
+    openWordPop(w);
   });
 
   document.body.appendChild(box);
@@ -375,6 +477,7 @@ function ensureOverlay() {
   if (video && window.ResizeObserver) {
     new ResizeObserver(positionOverlay).observe(video);
   }
+  applyColors();
   return box;
 }
 
@@ -468,6 +571,9 @@ async function start() {
     const player = await fetchPlayerResponse(videoId);
     state.title = player?.videoDetails?.title || document.title;
 
+    // 라이브는 완결된 자막 트랙이 없다 → 바로 Whisper 전사 모드
+    if (player?.videoDetails?.isLive) { startAsr(); return; }
+
     const track = pickTrack(player);
     let segments = [];
     if (track) {
@@ -482,20 +588,43 @@ async function start() {
     if (!segments.length) { startAsr(); return; }
 
     // 긴 자막을 한 요청으로 보내면 응답까지 몇 분씩 걸려 연결이 끊긴다.
-    // 청크로 나눠 순차 요청하고, 첫 청크부터 바로 자막을 띄운다.
-    const TRANSLATE_CHUNK = 120;
+    // 작은 청크로 나눠, "지금 보고 있는 지점" 주변부터 우선 번역해 바로 띄우고
+    // 나머지는 백그라운드로 채운다. 이웃 세그먼트는 문맥(CTX)으로 함께 보낸다.
+    const TRANSLATE_CHUNK = 48;
+    const CTX_N = 8;
     const chunks = [];
     for (let i = 0; i < segments.length; i += TRANSLATE_CHUNK) {
-      chunks.push(segments.slice(i, i + TRANSLATE_CHUNK));
+      chunks.push({ i0: i, segs: segments.slice(i, i + TRANSLATE_CHUNK) });
     }
+    const now = $("video")?.currentTime || 0;
+    const score = (c) => {
+      const s = c.segs[0].start, e = c.segs[c.segs.length - 1].end;
+      if (now >= s - 5 && now <= e) return -1;          // 지금 재생 중인 청크 최우선
+      return s >= now ? s - now : 1e6 + (now - s);      // 앞쪽 순서대로, 지나간 쪽은 마지막에
+    };
+    const order = [...chunks].sort((a, b) => score(a) - score(b));
+
     showStatus(`번역 중 (${segments.length}줄)`, true);
-    for (let i = 0; i < chunks.length; i++) {
-      const lines = await requestTranslation(videoId, track.languageCode, chunks[i]);
+    for (let k = 0; k < order.length; k++) {
+      const c = order[k];
+      let lines;
+      try {
+        lines = await requestTranslation(videoId, track.languageCode, c.segs, {
+          before: segments.slice(Math.max(0, c.i0 - CTX_N), c.i0).map((s) => s.text),
+          after: segments.slice(c.i0 + c.segs.length, c.i0 + c.segs.length + CTX_N).map((s) => s.text),
+        });
+      } catch (e) {
+        // 이미 자막이 떠 있으면 오류로 전부 덮지 말고 있는 것만 유지한다
+        log(`번역 청크 ${k + 1}/${order.length} 실패`, e.message);
+        if (!state.lines.length) throw e;
+        toast(`번역 일부 실패`);
+        break;
+      }
       if (state.videoId !== videoId || !state.active) return;   // 도중에 이동/중지됨
       state.lines = state.lines.concat(lines).sort((a, b) => a.start - b.start);
       state.idx = -2;
       if (!state.rafId) loop();          // 첫 청크 도착 즉시 표시 시작
-      log(`번역 ${i + 1}/${chunks.length} 청크 (${state.lines.length}줄)`);
+      log(`번역 ${k + 1}/${order.length} 청크 (${state.lines.length}줄)`);
     }
     log(`준비 완료: ${state.lines.length}줄`);
   } catch (e) {
@@ -519,6 +648,7 @@ document.addEventListener("keydown", (e) => {
   const el = document.activeElement;
   if (el?.tagName === "INPUT" || el?.tagName === "TEXTAREA" || el?.isContentEditable) return;
 
+  if (e.code === "Escape" && popEl) { e.preventDefault(); closeWordPop(); return; }
   if (e.altKey && e.code === "KeyT") { e.preventDefault(); toggle(); return; }
   if (!state.active) return;
 
@@ -582,6 +712,7 @@ function watchNavigation() {
   await loadConfig();
   browser.storage.onChanged.addListener(async () => {
     await loadConfig();
+    applyColors();
     state.idx = -2;
   });
 

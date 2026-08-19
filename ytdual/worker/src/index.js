@@ -18,10 +18,27 @@ const CONCURRENCY = 3;
 const MAX_SEGMENTS = 8000;
 const MAX_CARDS = 2000;
 
-const SYSTEM = (target) => `You merge broken YouTube caption fragments into natural sentences and translate them for a language learner.
+const SYSTEM = (target) => `You merge broken YouTube caption fragments into natural subtitle lines and translate them for a language learner.
+
+Work in two steps:
+1) MERGE: join fragments into complete sentences with proper punctuation.
+   Fragments are cut mid-sentence at random points — a fragment boundary
+   means nothing. Never end a line just because a fragment ended.
+2) SPLIT into subtitle lines:
+   - A sentence of up to ~14 words is ONE line. Never put two sentences in one line.
+   - A longer sentence becomes several lines of ~5-12 words, each split at a
+     clause boundary (comma, conjunction, relative clause) so every line is a
+     coherent phrase. Never end a line on a dangling subject, article, or
+     preposition ("... so I" is wrong; break before "so").
+   - A very short interjection ("Yeah.", "[sighs]") joins the adjacent line.
+   - A trailing conjunction or discourse marker ("So,", "And", "But") STARTS
+     the next line — it never ends a line.
 
 Rules:
-- Merge fragments belonging to one sentence. Split run-on blocks at sentence boundaries.
+- Lines starting with "CTX-" (preceding) or "CTX+" (following) are surrounding
+  context only. Use them so the translation connects naturally across chunk
+  boundaries, but NEVER output lines for them — indices cover only the
+  numbered fragments.
 - Use the surrounding context: resolve pronouns and dropped subjects so each line reads naturally on its own.
 - Never invent, omit, summarize, or reorder content.
 - "s" = index of the FIRST source fragment a line covers, "e" = index of the LAST.
@@ -53,8 +70,12 @@ async function sha1(str) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ── 번역 ─────────────────────────────────────────────────────────────
-async function translateBatch(env, batch, target) {
-  const payload = batch.map((s, i) => `${i}: ${s.text}`).join("\n");
+async function translateBatch(env, batch, target, ctxB = [], ctxA = []) {
+  const payload =
+    ctxB.map((t) => `CTX-: ${t}`).join("\n") +
+    (ctxB.length ? "\n" : "") +
+    batch.map((s, i) => `${i}: ${s.text}`).join("\n") +
+    (ctxA.length ? "\n" + ctxA.map((t) => `CTX+: ${t}`).join("\n") : "");
 
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
@@ -91,13 +112,33 @@ async function translateBatch(env, batch, target) {
         const orig = String(ln.o ?? "").trim();
         if (!orig) continue;
         out.push({
+          s,
+          e,
           start: batch[s].start,
           end: batch[e].end,
           orig,
           trans: String(ln.t ?? "").trim(),
         });
       }
-      if (out.length) return { lines: out };
+      // 같은 fragment 구간을 여러 줄로 쪼갠 경우 시간도 글자수 비례로 나눈다
+      // (안 나누면 start 가 같아져 앞줄이 표시되지 않는다)
+      let i = 0;
+      while (i < out.length) {
+        let j = i;
+        while (j + 1 < out.length && out[j + 1].s === out[i].s && out[j + 1].e === out[i].e) j++;
+        if (j > i) {
+          const t0 = out[i].start, t1 = out[i].end;
+          const total = out.slice(i, j + 1).reduce((n, l) => n + l.orig.length, 0) || 1;
+          let acc = 0;
+          for (let k = i; k <= j; k++) {
+            out[k].start = t0 + ((t1 - t0) * acc) / total;
+            acc += out[k].orig.length;
+            out[k].end = t0 + ((t1 - t0) * acc) / total;
+          }
+        }
+        i = j + 1;
+      }
+      if (out.length) return { lines: out.map(({ s, e, ...rest }) => rest) };
     } catch {
       if (attempt === 2) break;
       await sleep(500 * 2 ** attempt);
@@ -111,7 +152,162 @@ async function translateBatch(env, batch, target) {
   };
 }
 
-async function translateAll(env, segments, target) {
+// ── 긴 줄 강제 분할 (LLM 이 제한을 어겨도 자막은 짧게 유지) ──────────
+const MAX_LINE_CHARS = 70;
+
+/** 절 경계(쉼표·마침표류)로 쪼개고, 그래도 긴 조각은 단어 경계에서 자른다 */
+function clausePieces(s) {
+  return s
+    .split(/(?<=[,;:.!?…。、])\s*/)
+    .flatMap((p) => {
+      const out = [];
+      let t = p.trim();
+      while (t.length > MAX_LINE_CHARS) {
+        let cut = t.lastIndexOf(" ", MAX_LINE_CHARS);
+        if (cut < 20) cut = MAX_LINE_CHARS;
+        out.push(t.slice(0, cut).trim());
+        t = t.slice(cut).trim();
+      }
+      if (t) out.push(t);
+      return out;
+    })
+    .filter(Boolean);
+}
+
+/** 원문용: 하드 캡을 넘지 않게 앞에서부터 채워 묶는다 */
+function packByCap(pieces) {
+  const groups = [];
+  let cur = "";
+  for (const p of pieces) {
+    if (cur && (cur.length + 1 + p.length) > MAX_LINE_CHARS) { groups.push(cur); cur = p; }
+    else cur = cur ? cur + " " + p : p;
+  }
+  if (cur) groups.push(cur);
+  return groups;
+}
+
+/** 번역용: 정확히 k 그룹으로, 글자수 균형을 맞춰 묶는다 */
+function packToK(pieces, k) {
+  const total = pieces.reduce((n, p) => n + p.length, 0);
+  const groups = [];
+  let cur = "", done = 0;
+  for (let i = 0; i < pieces.length; i++) {
+    cur = cur ? cur + " " + pieces[i] : pieces[i];
+    done += pieces[i].length;
+    const groupsLeft = k - groups.length - 1;
+    const piecesLeft = pieces.length - i - 1;
+    if (groupsLeft > 0 && piecesLeft >= groupsLeft) {
+      const target = (total * (groups.length + 1)) / k;
+      const nextLen = i + 1 < pieces.length ? pieces[i + 1].length : 0;
+      if (done >= target || done + nextLen / 2 > target) { groups.push(cur); cur = ""; }
+    }
+  }
+  if (cur) groups.push(cur);
+  return groups;
+}
+
+function splitLine(line) {
+  if (line.orig.length <= MAX_LINE_CHARS) return [line];
+  const oParts = packByCap(clausePieces(line.orig));
+  const n = oParts.length;
+  if (n < 2) return [line];
+  const tParts = line.trans ? packToK(clausePieces(line.trans), n) : [];
+  const dur = line.end - line.start;
+  const total = oParts.reduce((s, p) => s + p.length, 0) || 1;
+  const out = [];
+  let acc = 0;
+  for (let i = 0; i < n; i++) {
+    const start = line.start + (dur * acc) / total;
+    acc += oParts[i].length;
+    out.push({ start, end: line.start + (dur * acc) / total, orig: oParts[i], trans: tParts[i] || "" });
+  }
+  return out;
+}
+
+/** 긴 줄 분할 2차 패스: 원문·번역을 의미 정렬 상태로 함께 k 등분시킨다.
+ *  (기계 분할은 두 언어의 절 경계가 어긋나 번역이 반토막 나므로 폴백으로만 쓴다) */
+const SPLIT_SYSTEM = `You split subtitle line pairs into shorter aligned pairs.
+For each input item, split the original "o" into "k" consecutive shorter lines
+at natural clause boundaries, and split the translation "t" into the same
+number of parts so each part translates its corresponding original part.
+- Do not add, drop, reorder, or reword anything.
+- A trailing conjunction or discourse marker ("So,", "And") belongs with the FOLLOWING line.
+- Every part must be non-empty; parts joined in order must reproduce the full text.
+Output ONLY: {"items":[{"parts":[{"o":"...","t":"..."}]}]} — items in input order.
+No markdown fences, no commentary.`;
+
+async function llmSplitLines(env, items) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const res = await fetch(env.LLM_URL || DEFAULT_LLM_URL, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${env.OPENAI_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: LLM_MODEL,
+          reasoning: { effort: REASONING },
+          response_format: { type: "json_object" },
+          messages: [
+            { role: "system", content: SPLIT_SYSTEM },
+            { role: "user", content: JSON.stringify(items) },
+          ],
+        }),
+      });
+      if (res.status === 429 || res.status >= 500) { await sleep(500 * 2 ** attempt); continue; }
+      if (!res.ok) throw new Error(`llm ${res.status}`);
+      const data = await res.json();
+      const parsed = JSON.parse(data.choices[0].message.content);
+      if (Array.isArray(parsed.items)) return parsed.items;
+    } catch {
+      await sleep(500 * 2 ** attempt);
+    }
+  }
+  return null;
+}
+
+async function enforceShortLines(env, lines) {
+  const idx = lines.map((l, i) => (l.orig.length > MAX_LINE_CHARS ? i : -1)).filter((i) => i >= 0);
+  if (!idx.length) return lines;
+
+  const items = idx.map((i) => ({
+    o: lines[i].orig,
+    t: lines[i].trans,
+    k: Math.min(6, Math.ceil(lines[i].orig.length / 55)),
+  }));
+  // 한 번에 너무 많이 보내지 않는다
+  const results = [];
+  for (let i = 0; i < items.length; i += 30) {
+    const part = env.OPENAI_API_KEY ? await llmSplitLines(env, items.slice(i, i + 30)) : null;
+    results.push(...(part || items.slice(i, i + 30).map(() => null)));
+  }
+
+  const out = [];
+  lines.forEach((l, i) => {
+    const pos = idx.indexOf(i);
+    if (pos === -1) { out.push(l); return; }
+    let pieces =
+      results[pos] && Array.isArray(results[pos].parts) && results[pos].parts.length >= 2
+        ? results[pos].parts
+            .map((p) => ({ orig: String(p.o ?? "").trim(), trans: String(p.t ?? "").trim() }))
+            .filter((p) => p.orig)
+        : null;
+    if (pieces && pieces.some((p) => p.orig.length > MAX_LINE_CHARS + 15)) pieces = null;
+    if (!pieces) { out.push(...splitLine(l)); return; }   // 기계 분할 폴백
+    const dur = l.end - l.start;
+    const total = pieces.reduce((n, p) => n + p.orig.length, 0) || 1;
+    let acc = 0;
+    for (const p of pieces) {
+      const start = l.start + (dur * acc) / total;
+      acc += p.orig.length;
+      out.push({ start, end: l.start + (dur * acc) / total, orig: p.orig, trans: p.trans });
+    }
+  });
+  return out;
+}
+
+async function translateAll(env, segments, target, ctxB = [], ctxA = []) {
   const batches = [];
   for (let i = 0; i < segments.length; i += BATCH) {
     batches.push(segments.slice(i, i + BATCH));
@@ -123,7 +319,12 @@ async function translateAll(env, segments, target) {
   const runner = async () => {
     while (cursor < batches.length) {
       const my = cursor++;
-      const r = await translateBatch(env, batches[my], target);
+      // 요청 문맥은 첫/마지막 배치에만 붙인다 (중간 배치는 이웃 배치가 곧 문맥)
+      const r = await translateBatch(
+        env, batches[my], target,
+        my === 0 ? ctxB : [],
+        my === batches.length - 1 ? ctxA : []
+      );
       if (r.degraded) degraded++;
       results[my] = r.lines;
     }
@@ -140,7 +341,7 @@ async function handleSubtitle(request, env, ctx) {
   let body;
   try { body = await request.json(); } catch { return json({ error: "invalid json" }, 400); }
 
-  const { videoId, lang = "", target = "Korean", segments } = body;
+  const { videoId, lang = "", target = "Korean", segments, ctxBefore, ctxAfter } = body;
   if (!videoId || !Array.isArray(segments) || !segments.length) {
     return json({ error: "videoId 와 segments 가 필요합니다" }, 400);
   }
@@ -148,8 +349,13 @@ async function handleSubtitle(request, env, ctx) {
     return json({ error: `자막이 너무 깁니다 (${segments.length}줄)` }, 413);
   }
 
-  const fingerprint = await sha1(segments.map((s) => s.text).join("\u0001"));
-  const key = `sub:v2:${videoId}:${lang}:${target}:${fingerprint.slice(0, 12)}`;
+  const ctxB = (Array.isArray(ctxBefore) ? ctxBefore : []).map((t) => String(t).slice(0, 400)).slice(-12);
+  const ctxA = (Array.isArray(ctxAfter) ? ctxAfter : []).map((t) => String(t).slice(0, 400)).slice(0, 12);
+
+  const fingerprint = await sha1(
+    [...ctxB, "\u0002", ...segments.map((s) => s.text), "\u0002", ...ctxA].join("\u0001")
+  );
+  const key = `sub:v5:${videoId}:${lang}:${target}:${fingerprint.slice(0, 12)}`;  // v5: 문맥 연결 번역
 
   const hit = env.SUBS && (await env.SUBS.get(key, "json"));
   if (hit) return json({ lines: hit, cached: true });
@@ -164,7 +370,8 @@ async function handleSubtitle(request, env, ctx) {
       text: s.text.trim().slice(0, 400),
     }));
 
-  const { lines, degraded } = await translateAll(env, clean, target);
+  let { lines, degraded } = await translateAll(env, clean, target, ctxB, ctxA);
+  lines = await enforceShortLines(env, lines);   // 캐시에도 분할된 형태로 저장된다
   if (!lines.length) return json({ error: "번역 실패" }, 502);
 
   // 일부라도 실패했으면 캐시하지 않는다 (다음에 온전히 재시도)
@@ -217,6 +424,119 @@ async function handleTranscribe(request, env) {
     return json({ segments });
   }
   return json({ error: "groq 재시도 초과" }, 502);
+}
+
+// ── 단어 사전 (자막 단어 클릭 → 문맥상 뜻) ──────────────────────────
+const WORD_SYSTEM = (target) => `You are a dictionary for a language learner. Given a word and the sentence it appears in, explain it in ${target}.
+- "meaning": what the word means IN THIS SENTENCE, in ${target}, one short phrase.
+- "base": dictionary form with part of speech and 1-2 core senses, one short line in ${target}.
+Output ONLY: {"meaning":"...","base":"..."}
+No markdown fences, no commentary.`;
+
+async function handleWord(request, env, ctx) {
+  let body;
+  try { body = await request.json(); } catch { return json({ error: "invalid json" }, 400); }
+  const { word, sentence = "", target = "Korean" } = body;
+  if (!word || typeof word !== "string") return json({ error: "word 필요" }, 400);
+
+  const fp = await sha1(`${word}${sentence}${target}`);
+  const key = `word:v1:${fp.slice(0, 16)}`;
+  const hit = env.SUBS && (await env.SUBS.get(key, "json"));
+  if (hit) return json({ ...hit, cached: true });
+  if (!env.OPENAI_API_KEY) return json({ error: "OPENAI_API_KEY 미설정" }, 500);
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const res = await fetch(env.LLM_URL || DEFAULT_LLM_URL, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${env.OPENAI_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: LLM_MODEL,
+          reasoning: { effort: REASONING },
+          response_format: { type: "json_object" },
+          messages: [
+            { role: "system", content: WORD_SYSTEM(target) },
+            { role: "user", content: JSON.stringify({ word: word.slice(0, 60), sentence: sentence.slice(0, 400) }) },
+          ],
+        }),
+      });
+      if (res.status === 429 || res.status >= 500) { await sleep(500 * 2 ** attempt); continue; }
+      if (!res.ok) throw new Error(`llm ${res.status}`);
+      const data = await res.json();
+      const parsed = JSON.parse(data.choices[0].message.content);
+      const out = {
+        meaning: String(parsed.meaning ?? "").trim(),
+        base: String(parsed.base ?? "").trim(),
+      };
+      if (out.meaning) {
+        if (env.SUBS) ctx.waitUntil(env.SUBS.put(key, JSON.stringify(out)));
+        return json({ ...out, cached: false });
+      }
+    } catch {
+      await sleep(500 * 2 ** attempt);
+    }
+  }
+  return json({ error: "사전 실패" }, 502);
+}
+
+// ── 페이지 번역 (문단 밑에 번역 삽입) ───────────────────────────────
+const PAGE_SYSTEM = (target) => `Translate each numbered text into ${target} for a reader skimming a web page.
+- Keep the tone and register of the source.
+- Keep proper nouns, code, commands, and technical identifiers untranslated.
+- If a text is already in ${target}, return it unchanged.
+Output ONLY: {"t":["...","..."]} — one translation per input, same order, same count.
+No markdown fences, no commentary.`;
+
+async function handlePage(request, env, ctx) {
+  let body;
+  try { body = await request.json(); } catch { return json({ error: "invalid json" }, 400); }
+  const { texts, target = "Korean" } = body;
+  if (!Array.isArray(texts) || !texts.length) return json({ error: "texts 필요" }, 400);
+  if (texts.length > 200) return json({ error: `texts 너무 많음 (${texts.length})` }, 413);
+  const clean = texts.map((t) => String(t).slice(0, 2000));
+
+  const fp = await sha1(clean.join("") + "" + target);
+  const key = `page:v1:${fp.slice(0, 16)}`;
+  const hit = env.SUBS && (await env.SUBS.get(key, "json"));
+  if (hit) return json({ t: hit, cached: true });
+  if (!env.OPENAI_API_KEY) return json({ error: "OPENAI_API_KEY 미설정" }, 500);
+
+  const payload = clean.map((t, i) => `${i}: ${t}`).join("\n");
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const res = await fetch(env.LLM_URL || DEFAULT_LLM_URL, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${env.OPENAI_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: LLM_MODEL,
+          reasoning: { effort: REASONING },
+          response_format: { type: "json_object" },
+          messages: [
+            { role: "system", content: PAGE_SYSTEM(target) },
+            { role: "user", content: payload },
+          ],
+        }),
+      });
+      if (res.status === 429 || res.status >= 500) { await sleep(500 * 2 ** attempt); continue; }
+      if (!res.ok) throw new Error(`llm ${res.status}`);
+      const data = await res.json();
+      const parsed = JSON.parse(data.choices[0].message.content);
+      const t = Array.isArray(parsed.t) ? parsed.t.map((x) => String(x ?? "")) : null;
+      if (t && t.length === clean.length) {
+        if (env.SUBS) ctx.waitUntil(env.SUBS.put(key, JSON.stringify(t)));
+        return json({ t, cached: false });
+      }
+    } catch {
+      await sleep(500 * 2 ** attempt);
+    }
+  }
+  return json({ error: "번역 실패" }, 502);
 }
 
 // ── 카드 큐 (폰에서 저장 → PC 에서 Anki 로) ──────────────────────────
@@ -297,6 +617,8 @@ export default {
     if (p === "/") return new Response("YT Dual worker v2 ok", { headers: CORS });
     if (p === "/api/subtitle" && m === "POST") return handleSubtitle(request, env, ctx);
     if (p === "/api/transcribe" && m === "POST") return handleTranscribe(request, env);
+    if (p === "/api/word" && m === "POST") return handleWord(request, env, ctx);
+    if (p === "/api/page" && m === "POST") return handlePage(request, env, ctx);
     if (p === "/api/cards" && m === "GET") return handleCardsGet(url, env);
     if (p === "/api/cards" && m === "POST") return handleCardsPost(request, env);
     if (p === "/api/cards/ack" && m === "POST") return handleCardsAck(request, env);
