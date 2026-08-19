@@ -8,11 +8,40 @@
  *  POST /api/cards/ack   Anki 반영 끝난 카드 비우기
  *
  * 확장이 자막을 직접 가져오므로 Worker는 유튜브에 접속하지 않습니다.
- */
+ *
+ * ── 불변식 ──────────────────────────────────────────────────────────
+ * [실측] 은 Phase 4 에서 실제로 실행해 확인한 것.
+ *
+ *  W1  degraded(일부 배치 실패) 결과는 캐시하지 않는다. 캐시하면 실패가 영구화된다.
+ *  W2  출력 줄의 형태나 프롬프트 의미가 바뀌면 캐시 키 버전을 반드시 올린다.
+ *      안 올리면 옛 형태의 결과가 계속 서빙되어 변경이 없던 일이 된다.
+ *  W3  요청 하나의 크리티컬 패스에 LLM 왕복은 1회 이하다 (확장이 BATCH 보다 작게
+ *      보내는 한). 2차 패스를 되살리면 청크당 지연이 그대로 2배가 된다.
+ *  W4  MAX_LINE_CHARS 는 1차 프롬프트가 실제로 생성하는 최대 줄 길이보다 커야 한다.
+ *      작으면 사실상 모든 요청이 분할 경로를 타므로 W3 가 깨진다.        [실측: 관측 최장 82자]
+ *  W5  모든 상류 fetch 는 유한 타임아웃을 가진다. 타임아웃이 없으면 멈춘 업스트림
+ *      하나가 요청을 무기한 붙잡고 확장 쪽 runner 까지 함께 묶는다.
+ *  W6  재시도 층은 하나뿐이다. 확장도 재시도하면 횟수가 곱해진다 (현재 위반).
+ *  W7  실패한 배치는 원문만 남기고 반환한다. 요청 전체를 날리지 않는다.
+ *  W8  LLM_MODEL 은 GPT 계열이어야 한다. Claude 계열은 이 프록시가 Claude Code
+ *      세션으로 라우팅해 시스템 프롬프트를 무시하므로 쓸 수 없다.        [실측]
+ *  W9  응답 지연은 출력 토큰 수에 정비례한다. 프롬프트가 더 뱉게 만드는 모든 변경은
+ *      곧바로 지연이다.                    [실측: 4000토큰 73초 / 672토큰 13.7초]
+ * ──────────────────────────────────────────────────────────────────── */
 
+// 불변식 W8: GPT 계열만. Claude 계열로 바꾸면 프록시가 Claude Code 세션으로 라우팅해
+//   시스템 프롬프트를 무시한다 (Phase 4 실측: 1.5초 만에 "I'm Claude Code" 응답).
 const LLM_MODEL = "gpt-5.6-luna";
 const DEFAULT_LLM_URL = "https://api.openai.com/v1/chat/completions";
+// Phase 4 실측으로 조정 폐기: low=73/77s, none=70/69s, minimal=49/100s(분산만 커짐).
+//   효과 4% 라 품질 위험을 감수할 이유가 없다. 지연은 REASONING 이 아니라 출력 토큰이 만든다(W9).
 const REASONING = "low";     // 번역은 추론이 거의 필요 없음. none 도 가능
+// TODO(phase6): 이 값을 Phase 4 측정 0 에서 나온 LLM 왕복 실측치의 3~4배로 다시 정한다.
+//   90000 은 측정 전에 임의로 넣은 값이라 근거가 없다.
+const LLM_TIMEOUT_MS = 90000;  // LLM 호출 1회의 상한. 멈춘 업스트림이 슬롯을 영구 점유하지 못하게 한다
+// 불변식 W3: 확장이 BATCH 보다 작은 요청만 보내는 한 batches.length 는 항상 1 이고,
+//   아래 CONCURRENCY runner 풀은 단일 순차 호출로 축퇴한다 — 즉 죽은 코드다.
+//   실제 동시성 손잡이는 확장 쪽 runner 개수뿐이다 (I13: 8개 이하).
 const BATCH = 200;           // 컨텍스트 1.05M 이라 넉넉히. 문맥이 클수록 번역 품질↑
 const CONCURRENCY = 3;
 const MAX_SEGMENTS = 8000;
@@ -77,6 +106,9 @@ async function translateBatch(env, batch, target, ctxB = [], ctxA = []) {
     batch.map((s, i) => `${i}: ${s.text}`).join("\n") +
     (ctxA.length ? "\n" + ctxA.map((t) => `CTX+: ${t}`).join("\n") : "");
 
+  // TODO(phase6): 아래 fetch 에 AbortController + LLM_TIMEOUT_MS 를 건다. 지금은 타임아웃이
+  //   없어 업스트림이 멈추면 요청이 무기한 매달리고, 확장 쪽 runner 도 함께 묶인다 (불변식 10).
+  //   타임아웃 만료는 기존 catch 로 떨어져 재시도 경로를 그대로 탄다.
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       const res = await fetch(env.LLM_URL || DEFAULT_LLM_URL, {
@@ -153,7 +185,9 @@ async function translateBatch(env, batch, target, ctxB = [], ctxA = []) {
 }
 
 // ── 긴 줄 강제 분할 (LLM 이 제한을 어겨도 자막은 짧게 유지) ──────────
-const MAX_LINE_CHARS = 70;
+// 불변식 W4: 이 값이 1차 프롬프트가 실제로 만드는 최대 줄 길이보다 작으면 거의 모든
+//   요청이 분할 경로를 타서 W3(왕복 1회 이하)가 깨진다. Phase 4 관측 최장 82자.
+const MAX_LINE_CHARS = 85;   // Phase 4 관측 최장 82자 → 85 면 분할 경로가 거의 안 걸린다 (W4)
 
 /** 절 경계(쉼표·마침표류)로 쪼개고, 그래도 긴 조각은 단어 경계에서 자른다 */
 function clausePieces(s) {
@@ -236,6 +270,9 @@ number of parts so each part translates its corresponding original part.
 Output ONLY: {"items":[{"parts":[{"o":"...","t":"..."}]}]} — items in input order.
 No markdown fences, no commentary.`;
 
+// TODO(phase6): enforceShortLines 에서 이 함수 호출을 걷어내면 llmSplitLines 와 SPLIT_SYSTEM
+//   의 호출자가 0이 된다. 삭제할지 남길지는 Phase 4 측정 4(품질 회귀)를 보고 사용자가 정한다.
+//   품질 회귀가 크면 크리티컬 패스 밖(ctx.waitUntil 로 캐시만 개선)으로 옮기는 안이 남아 있다.
 async function llmSplitLines(env, items) {
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
@@ -267,6 +304,8 @@ async function llmSplitLines(env, items) {
   return null;
 }
 
+/* 불변식 W3 이 걸리는 지점. 여기서 LLM 을 부르면 요청당 왕복이 2회가 되어 청크 지연이
+ * 그대로 2배가 된다 (Phase 4 실측 기준 +70~100초). 기계 분할(splitLine)만 쓴다. */
 async function enforceShortLines(env, lines) {
   const idx = lines.map((l, i) => (l.orig.length > MAX_LINE_CHARS ? i : -1)).filter((i) => i >= 0);
   if (!idx.length) return lines;
@@ -277,11 +316,8 @@ async function enforceShortLines(env, lines) {
     k: Math.min(6, Math.ceil(lines[i].orig.length / 55)),
   }));
   // 한 번에 너무 많이 보내지 않는다
-  const results = [];
-  for (let i = 0; i < items.length; i += 30) {
-    const part = env.OPENAI_API_KEY ? await llmSplitLines(env, items.slice(i, i + 30)) : null;
-    results.push(...(part || items.slice(i, i + 30).map(() => null)));
-  }
+  // W3: LLM 2차 패스를 크리티컬 패스에서 뺐다. 전부 기계 분할(splitLine)로 간다.
+  const results = items.map(() => null);
 
   const out = [];
   lines.forEach((l, i) => {
@@ -355,8 +391,11 @@ async function handleSubtitle(request, env, ctx) {
   const fingerprint = await sha1(
     [...ctxB, "\u0002", ...segments.map((s) => s.text), "\u0002", ...ctxA].join("\u0001")
   );
-  const key = `sub:v5:${videoId}:${lang}:${target}:${fingerprint.slice(0, 12)}`;  // v5: 문맥 연결 번역
+  const key = `sub:v6:${videoId}:${lang}:${target}:${fingerprint.slice(0, 12)}`;  // v6: 기계 분할, 85자 (W2)
 
+  // 불변식 W2: 위 키의 버전(sub:vN)은 출력 줄 형태가 바뀔 때마다 올려야 한다.
+  //   Phase 4 실측 — 캐시 히트는 0.0초(미스 대비 약 2만배)라 이 경로가 사실상 전부다.
+  //   버전을 안 올리면 옛 형태가 계속 나가고 변경이 없던 일이 된다.
   const hit = env.SUBS && (await env.SUBS.get(key, "json"));
   if (hit) return json({ lines: hit, cached: true });
 
@@ -483,10 +522,16 @@ async function handleWord(request, env, ctx) {
 }
 
 // ── 페이지 번역 (문단 밑에 번역 삽입) ───────────────────────────────
-const PAGE_SYSTEM = (target) => `Translate each numbered text into ${target} for a reader skimming a web page.
-- Keep the tone and register of the source.
+const PAGE_SYSTEM = (target) => `Translate each numbered text into ${target}, as a professional translator would for a published ${target} edition of this web page.
+- Translate meaning, not words: rephrase into what a native ${target} writer
+  would naturally say. Never leave stiff, word-for-word phrasing.
+- Keep the register consistent: documentation in plain declarative style,
+  casual writing in a casual voice.
 - Keep proper nouns, code, commands, and technical identifiers untranslated.
 - If a text is already in ${target}, return it unchanged.
+- Texts may contain inline markers like <t0>…</t0> (links, bold, code spans).
+  Keep each marker pair, with the SAME number, around the corresponding
+  translated words. Never drop, add, nest, or renumber markers.
 Output ONLY: {"t":["...","..."]} — one translation per input, same order, same count.
 No markdown fences, no commentary.`;
 
@@ -499,7 +544,7 @@ async function handlePage(request, env, ctx) {
   const clean = texts.map((t) => String(t).slice(0, 2000));
 
   const fp = await sha1(clean.join("") + "" + target);
-  const key = `page:v1:${fp.slice(0, 16)}`;
+  const key = `page:v2:${fp.slice(0, 16)}`;
   const hit = env.SUBS && (await env.SUBS.get(key, "json"));
   if (hit) return json({ t: hit, cached: true });
   if (!env.OPENAI_API_KEY) return json({ error: "OPENAI_API_KEY 미설정" }, 500);
@@ -515,7 +560,7 @@ async function handlePage(request, env, ctx) {
         },
         body: JSON.stringify({
           model: LLM_MODEL,
-          reasoning: { effort: REASONING },
+          reasoning: { effort: "medium" },   // 페이지 번역은 실시간성이 덜해 품질 우선
           response_format: { type: "json_object" },
           messages: [
             { role: "system", content: PAGE_SYSTEM(target) },
