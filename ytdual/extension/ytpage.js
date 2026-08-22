@@ -65,6 +65,14 @@
  * @property {string} [kind]               "asr" 이면 자동생성
  * @property {string} [trackName]          보통 "". 값이 있으면 채팅·코멘터리 같은 부속 트랙
  * @property {string} [translatedLanguage] 있으면 자동 번역 파생 트랙 — 원문이 아니다
+ *
+ * ★ Phase 4 실측 (VBMUMuZBxw0, Chrome 151) — 위 "확인되지 않았다"가 해소됐다:
+ *     vssId  양쪽에 있고 값이 같다 (".en-US._5Vp3ULVrJE", "a.en"). 1순위 대조 근거다
+ *     kind   런타임에도 있다 ("asr" / "")
+ *     trackName  런타임에는 없다. 대신 displayName·languageName 이 온다
+ *     pot    런타임 url 에만 있다 (potc 도 함께). baseUrl 에는 없다
+ *   ★★ 두 목록은 순서가 다르다 — 런타임 [채팅, ASR], 정적 [ASR, 채팅].
+ *      그래서 인덱스로 대조하면 조용히 다른 트랙을 가져온다 (content.js I27).
  */
 
 /**
@@ -99,6 +107,22 @@
  * @property {RawTrack[]}     tracks   런타임 트랙. 못 얻었으면 빈 배열
  * @property {object|null}    player   window.ytInitialPlayerResponse. 못 읽었으면 null
  * @property {PageDataReason} reason
+ *
+ * 불변식
+ *  I28 videoId 는 반드시 실어 보낸다. 받는 쪽이 대조 없이 쓰면 안 되기 때문이다.
+ *      세계 사이 왕복 중 SPA 이동이 일어날 수 있고, ytInitialPlayerResponse 는 이동
+ *      뒤에도 갱신되지 않을 수 있다.
+ *  I29 여기 담기는 것은 "본 것"뿐이다. 고른 결과나 순위는 담지 않는다.
+ *
+ * ★ 세계 경계를 넘는 형식은 이 객체가 아니라 이 객체를 JSON.stringify 한 문자열이다.
+ *   MAIN 세계에서 만든 객체를 격리 세계가 그대로 읽는 규칙은 브라우저마다 다르다
+ *   (Firefox 는 Xray 로 막고 cloneInto 를 요구한다). Zen 이 주 브라우저이므로
+ *   문자열로 통일한다. Chrome 에서는 객체도 통하지만 두 벌을 두지 않는다.
+ *   [Phase 4: Chrome 151 에서 문자열 왕복 정상 확인. Firefox 계열은 미검증]
+ *
+ * ★ 이 typedef 에는 client 필드가 빠져 있다. Phase 4 에서 c 파라미터가 필수임이
+ *   드러났고(content.js I30), 그 값(ytcfg 의 INNERTUBE_CLIENT_NAME)은 페이지 세계에서만
+ *   읽을 수 있다. Phase 6 에서 client 를 이 구조에 추가해야 한다.
  */
 
 /* 두 세계를 잇는 채널 이름.
@@ -115,14 +139,30 @@
 const YTDUAL_PAGE_REQ = "ytdual-get-page-data";
 const YTDUAL_PAGE_RES = "ytdual-page-data";
 
+/** 런타임 트랙에 pot 이 붙기를 기다릴 상한.
+ *
+ *  ★ I26 — content.js 의 PAGE_DATA_TIMEOUT_MS 가 이 값보다 커야 한다. 두 숫자는
+ *    짝이고 서로 다른 파일에 있으며, 어긋나도 아무도 오류를 내지 않는다.
+ *
+ *  값의 근거 [Phase 6 실측, Chrome 151, document_start 기준 영상 6종 × 2회]:
+ *    1089 1432 1464 1505 1506 1562 1585 1594 1605 1701 1770 1836 ms — 12/12 성공,
+ *    중앙 1585, 최대 1836. 관측 최대의 약 2.2배를 상한으로 잡는다.
+ *    (3000 으로 잡았다가 실제 확장에서 간헐적으로 놓치는 것을 봤다. 이 상한은
+ *     성공하는 경우의 속도에는 영향이 없다 — 붙는 즉시 반환하기 때문이다.
+ *     오직 실패하는 경우에만 이만큼 기다린다.)
+ *
+ *  ★ 정지 중인 영상은 이 상한으로 못 잡는다. pot 은 재생이 시작돼야 붙는다
+ *    [실측: 같은 영상이 정지 19,628ms / 재생 135ms]. 기다림으로 풀 문제가 아니라서
+ *    상한을 20초로 올리지 않았다 — 올리면 정상 영상까지 20초를 기다릴 위험만 생긴다. */
+const PAGE_POLL_MS = 4000;
+const POLL_STEP_MS = 50;
+
 /* ── Phase 2: 시그니처만. 본문은 Phase 6 에서 채운다 ───────────────── */
 
 /** 지금 보고 있는 영상의 id. 페이지 세계에도 location 은 그대로 있다.
  *  @returns {string|undefined} watch 페이지가 아니면 undefined */
 function inferVideoId() {
-  // TODO(phase6): location.search 의 v 파라미터. watch 페이지만 다루므로
-  //   shorts/embed 경로는 보지 않는다 (필요해지면 그때).
-  throw new Error("not implemented");
+  return new URLSearchParams(location.search).get("v") || undefined;
 }
 
 /** window.ytInitialPlayerResponse 를 읽되, 지금 이 영상의 것일 때만 준다.
@@ -136,9 +176,8 @@ function inferVideoId() {
  *  @param {string} videoId  대조 기준. 어긋나면 null 을 준다
  *  @returns {object|null} */
 function readPlayerResponse(videoId) {
-  // TODO(phase6): window.ytInitialPlayerResponse 를 읽고
-  //   videoDetails.videoId === videoId 일 때만 돌려준다. 어긋나면 null (I28).
-  throw new Error("not implemented");
+  const p = window.ytInitialPlayerResponse;
+  return p?.videoDetails?.videoId === videoId ? p : null;    // I28
 }
 
 /** 플레이어가 초기화될 때까지 기다렸다가 런타임 자막 트랙을 읽는다.
@@ -153,6 +192,19 @@ function readPlayerResponse(videoId) {
  *
  *  폴링 헬퍼를 따로 만들지 않는다 — 부르는 곳이 여기 하나뿐이다.
  *
+ *  불변식
+ *    I26 ★ 이 함수의 폴링 상한은 content.js 의 PAGE_DATA_TIMEOUT_MS 보다 작아야 한다.
+ *        두 숫자는 짝이고, 서로 다른 파일에 있으며, 어긋나도 아무도 오류를 내지
+ *        않는다. Phase 4 에서 정확히 그렇게 깨졌다 — 여기 5초, 저기 3초라서 호출자가
+ *        먼저 포기했고, 자막이 있는 영상이 "유튜브가 막고 있다"로 표시됐다.
+ *        [실측: 클라를 7초로 올리자 같은 영상에서 3590줄 수집]
+ *        pot 은 재생이 시작되면 즉시 붙지만(0ms 관측), 콜드 스타트에서는 5초를
+ *        넘기는 경우가 있었다. 상한은 관대하게 잡고 클라는 그보다 더 관대해야 한다.
+ *    I29 트랙을 고르지 않는다. 정렬하지 않는다. 거르지 않는다. 본 대로 싣는다.
+ *        pot 이 없는 트랙도 hasPot:false 로 실어 보낸다 — 무엇을 쓸지는 content.js 가
+ *        정한다. (Phase 4 구현은 no-pot 일 때 트랙을 통째로 버렸는데, 그러면 받는
+ *        쪽이 "트랙이 없다"와 "pot 이 아직 없다"를 구분할 수 없어진다.)
+ *
  *  @param {string} videoId  뽑는 도중 영상이 바뀌었는지 볼 기준
  *  @returns {Promise<{tracks: RawTrack[], reason: PageDataReason}>}
  *
@@ -162,12 +214,36 @@ function readPlayerResponse(videoId) {
  *    뭉치면 FetchResult 에서 이미 저질렀던 실수(수집 실패와 자막 없음을 같은 값으로
  *    만들어 유료 전사가 오발동)를 새 자리에서 반복하게 된다. */
 async function runtimeTracks(videoId) {
-  // TODO(phase6): #movie_player 를 찾아 getAudioTrack().captionTracks 를 읽는다.
-  //   pot 붙은 url 이 하나라도 나올 때까지 짧은 간격으로 다시 보고, 상한을 넘기면
-  //   timeout 으로 보고한다 (I26). 이유 구분은 no-player / no-tracks / no-pot /
-  //   timeout / video-changed 다 — 하나로 뭉치지 않는다.
-  //   ★ 트랙을 고르지 않는다. 정렬도 하지 않는다. 본 대로 보고한다 (I29).
-  throw new Error("not implemented");
+  const deadline = Date.now() + PAGE_POLL_MS;
+  let seen = [];                 // I29: pot 이 없어도 본 것은 그대로 실어 보낸다
+  let why = "no-player";
+  for (;;) {
+    if (inferVideoId() !== videoId) return { tracks: [], reason: "video-changed" };
+
+    const p = document.querySelector("#movie_player");
+    const raw = typeof p?.getAudioTrack === "function" ? p.getAudioTrack()?.captionTracks : null;
+    if (!Array.isArray(raw) || !raw.length) {
+      why = p ? "no-tracks" : "no-player";
+    } else {
+      seen = raw.map((t) => {
+        const url = t.url || t.baseUrl || "";
+        let hasPot = false;
+        try { hasPot = new URL(url, location.href).searchParams.has("pot"); } catch {}
+        return {
+          url, baseUrl: t.baseUrl, languageCode: t.languageCode,
+          vssId: t.vssId, kind: t.kind, trackName: t.trackName,
+          translatedLanguage: t.translatedLanguage, hasPot,
+        };
+      });
+      if (seen.some((t) => t.hasPot)) return { tracks: seen, reason: "ok" };
+      why = "no-pot";
+    }
+
+    if (Date.now() >= deadline) {
+      return { tracks: seen, reason: why === "no-player" ? "timeout" : why };
+    }
+    await new Promise((r) => setTimeout(r, POLL_STEP_MS));
+  }
 }
 
 /** 페이지가 지금 알고 있는 것을 한 덩어리로 모은다. 판단은 하지 않는다.
@@ -177,10 +253,24 @@ async function runtimeTracks(videoId) {
  *
  *  @returns {Promise<PageData>} 실패해도 예외를 던지지 않는다. reason 에 담아 보낸다 */
 async function collectPageData() {
-  // TODO(phase6): inferVideoId → runtimeTracks → readPlayerResponse 를 모아
-  //   PageData 하나로 만든다. 마지막에 inferVideoId() 를 다시 불러 처음 값과
-  //   다르면 reason 을 video-changed 로 바꾼다 (I28).
-  throw new Error("not implemented");
+  const videoId = inferVideoId();
+  const blank = { videoId: videoId || "", title: "", tracks: [], player: null, client: "" };
+  if (!videoId) return { ...blank, reason: "no-player" };
+
+  const { tracks, reason } = await runtimeTracks(videoId);
+  // I28: 모으는 사이에 SPA 이동이 일어났으면 이 결과는 다른 영상의 것이다.
+  if (inferVideoId() !== videoId) return { ...blank, reason: "video-changed" };
+
+  const player = readPlayerResponse(videoId);
+  return {
+    videoId,
+    title: player?.videoDetails?.title || "",
+    tracks,
+    player,
+    // I30: c 파라미터 값. 격리 세계에는 ytcfg 가 없어 여기서만 읽을 수 있다.
+    client: window.ytcfg?.get?.("INNERTUBE_CLIENT_NAME") || "WEB",
+    reason,
+  };
 }
 
 /** 요청 이벤트를 듣고 collectPageData 결과를 돌려보낸다.
@@ -194,10 +284,19 @@ async function collectPageData() {
  *
  *  @returns {void} */
 function installBridge() {
-  // TODO(phase6): YTDUAL_PAGE_REQ 리스너를 달고, collectPageData() 결과를
-  //   YTDUAL_PAGE_RES CustomEvent 의 detail 로 dispatch 한다. 예외가 나도
-  //   반드시 응답한다 — 응답이 없으면 content.js 는 타임아웃까지 기다린다.
-  // TODO(phase6): 이 파일 맨 아래에서 installBridge() 를 한 번 호출한다.
-  //   그 호출이 이 파일의 유일한 top-level 실행이다.
-  throw new Error("not implemented");
+  document.addEventListener(YTDUAL_PAGE_REQ, () => {
+    collectPageData()
+      // 예외가 나도 반드시 응답한다. 침묵하면 content.js 는 상한까지 기다리고,
+      // 그 시간은 그대로 사용자가 자막 없이 보는 시간이 된다.
+      .catch((e) => ({
+        videoId: "", title: "", tracks: [], player: null, client: "",
+        reason: "no-player", error: String((e && e.message) || e),
+      }))
+      // 객체가 아니라 JSON 문자열로 보낸다 — PageData 주석의 세계 경계 계약 참조.
+      .then((data) => {
+        document.dispatchEvent(new CustomEvent(YTDUAL_PAGE_RES, { detail: JSON.stringify(data) }));
+      });
+  });
 }
+
+installBridge();

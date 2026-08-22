@@ -105,15 +105,80 @@ test("워커 엔드포인트가 manifest 의 host_permissions 안에 있다", ()
  * background 는 확장 출처로 요청하므로 그 판정을 받지 않는다. 그래서 워커 호출은
  * 전부 background 를 거쳐야 한다.
  */
-// TODO(phase6): 여기에 브리지 정합성 검사 3개를 추가한다.
-//   1) content.js 의 PAGE_REQ/PAGE_RES 값이 ytpage.js 의 YTDUAL_PAGE_REQ/RES 값과
-//      같은가. ★ 이름이 아니라 값을 비교할 것 — 두 파일의 상수 이름은 일부러 다르다
-//      (페이지 세계는 유튜브와 전역을 공유해 접두사가 필요하고, 격리 세계는 아니다).
-//      한쪽만 고치면 브리지는 오류 없이 조용히 죽고 "가끔 자막이 안 뜬다"로만 보인다.
-//   2) manifest 가 ytpage.js 를 world:"MAIN" 으로 올리는가. 격리 세계로 올라가면
-//      #movie_player.getAudioTrack() 이 undefined 라 이 파일 전체가 무의미해진다.
-//   3) ytpage.js 가 트랙을 고르지 않는가 (I29) — pickTrack/score/sort 같은 선택
-//      로직이 페이지 세계로 새면 node 테스트가 실물의 절반만 보게 된다.
+/* ── 페이지 세계 브리지 ──────────────────────────────────────────────
+ * ytpage.js 는 MAIN 세계에서 돌아 #movie_player.getAudioTrack() 을 읽는다. 격리
+ * 세계에서는 그 메서드가 undefined 라 pot 붙은 자막 URL 을 얻을 방법이 없다.
+ * 아래 검사들은 브라우저 없이 잡을 수 있는 것만 잡는다 — 실제 pot 수신은 못 잡는다.
+ */
+const ytpageJs = read("ytpage.js");
+
+test("★ 두 세계가 같은 채널 이름을 쓴다", () => {
+  // 이름이 아니라 값을 비교한다. 상수 이름은 일부러 다르다 — 페이지 세계는 유튜브와
+  // 전역을 공유해 접두사가 필요하고, 격리 세계는 그렇지 않다.
+  // 템플릿 리터럴 + RegExp 는 백슬래시가 두 단계로 먹혀 조용히 어긋난다.
+  // 선언 위치를 문자열로 찾고 그 뒤를 고정 정규식으로 읽는다.
+  const val = (src, name) => {
+    const i = src.indexOf(name + " = ");
+    return i < 0 ? null : src.slice(i).match(/"([^"]+)"/)?.[1];
+  };
+  const req = val(ytpageJs, "YTDUAL_PAGE_REQ");
+  const res = val(ytpageJs, "YTDUAL_PAGE_RES");
+  assert.ok(req && res, "ytpage.js 에서 채널 상수를 못 찾았다");
+  assert.equal(val(contentJs, "PAGE_REQ"), req, "요청 채널 이름이 두 파일에서 다르다");
+  assert.equal(val(contentJs, "PAGE_RES"), res, "응답 채널 이름이 두 파일에서 다르다");
+  // 한쪽만 고치면 브리지는 오류 없이 조용히 죽는다. 증상은 "가끔 자막이 안 뜬다"뿐이다.
+});
+
+test("★ I26 — 호출자의 상한이 페이지 세계의 상한보다 크다", () => {
+  const num = (src, name) => {
+    const i = src.indexOf(name + " = ");
+    return i < 0 ? NaN : Number(src.slice(i).match(/(\d+)/)?.[1]);
+  };
+  const client = num(contentJs, "PAGE_DATA_TIMEOUT_MS");
+  const page = num(ytpageJs, "PAGE_POLL_MS");
+  assert.ok(client > 0 && page > 0, "상한 상수를 못 찾았다");
+  assert.ok(client > page,
+    `클라 상한(${client})이 페이지 세계 상한(${page}) 이하다 — 호출자가 먼저 포기해 ` +
+    "조용히 정적 URL 로 강등되고, 자막이 있는 영상이 실패로 표시된다");
+});
+
+test("★ manifest 가 ytpage.js 를 MAIN 세계에 올린다", () => {
+  const cs = (manifest.content_scripts ?? []).find((c) => (c.js ?? []).includes("ytpage.js"));
+  assert.ok(cs, "manifest 에 ytpage.js 가 없다 — 브리지가 아예 안 뜬다");
+  assert.equal(cs.world, "MAIN",
+    "격리 세계로 올라가면 #movie_player.getAudioTrack() 이 undefined 라 파일 전체가 무의미하다");
+  assert.equal(cs.run_at, "document_start", "플레이어보다 먼저 리스너가 붙어 있어야 한다");
+});
+
+test("world:MAIN 을 지원하는 Firefox 버전을 요구한다", () => {
+  // world:"MAIN" 은 Firefox 128+ 다. 115 로 두면 Zen 에서 조용히 무시된다.
+  const v = parseFloat(manifest.browser_specific_settings?.gecko?.strict_min_version ?? "0");
+  assert.ok(v >= 128, `strict_min_version=${v} — world:"MAIN" 은 128 부터다`);
+});
+
+/** 주석을 걷어낸 실행 코드만 남긴다. 주석에는 다른 파일의 함수 이름이 얼마든지
+ *  나올 수 있고(설명하려면 이름을 불러야 한다), 그것까지 금지하면 검사가 아니라
+ *  방해가 된다. 검사 대상은 "페이지 세계가 실제로 무엇을 하는가"다. */
+const stripComments = (src) =>
+  src.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/(^|[^:])\/\/.*$/gm, "$1");
+
+test("★ I29 — 페이지 세계는 트랙을 고르지 않는다", () => {
+  // 선택 로직이 이쪽으로 새면 node 테스트가 실물의 절반만 보게 된다.
+  const code = stripComments(ytpageJs);
+  for (const bad of ["pickTrack", "panelTrack", "chooseSource", ".sort(", "score"]) {
+    assert.ok(!code.includes(bad),
+      `ytpage.js 실행 코드에 ${bad} 가 있다 — 판단은 content.js 에만 있어야 한다 (I29)`);
+  }
+});
+
+test("★ I30 — timedtext 요청은 pot(런타임 URL)과 c 를 함께 갖춘다", () => {
+  const fn = contentJs.slice(contentJs.indexOf("async function fetchSegments"));
+  const body = fn.slice(0, fn.indexOf("\n}"));
+  assert.match(body, /runtimeUrl \|\| track\.baseUrl/, "런타임 URL 을 우선하지 않는다");
+  assert.match(body, /searchParams\.set\("c"/,
+    "c 파라미터가 없다 — pot 이 있어도 200 + 빈 본문이 온다 [실측 20조합]");
+});
+
 const backgroundJs = read("background.js");
 
 test("★ content.js 는 워커를 직접 부르지 않는다 — background 를 거친다", () => {
