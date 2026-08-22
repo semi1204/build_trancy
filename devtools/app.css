@@ -1,0 +1,151 @@
+:root {
+  --bg: #0e1116;
+  --panel: #161b22;
+  --line: #262d38;
+  --fg: #e6edf3;
+  --dim: #8b949e;
+  --good: #3fb950;
+  --bad: #f85149;
+  --warn: #d29922;
+  --accent: #58a6ff;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 14px/1.55 -apple-system, "Pretendard", "Apple SD Gothic Neo", system-ui, sans-serif;
+}
+header {
+  position: sticky; top: 0; z-index: 20;
+  display: flex; align-items: center; justify-content: space-between; gap: 16px;
+  padding: 14px 22px;
+  background: rgba(14,17,22,.92);
+  backdrop-filter: blur(8px);
+  border-bottom: 1px solid var(--line);
+}
+h1 { font-size: 16px; margin: 0; letter-spacing: -.01em; }
+h2 { font-size: 14px; margin: 0 0 14px; color: var(--accent); font-weight: 600; }
+h3 { font-size: 12px; margin: 0 0 8px; color: var(--dim); font-weight: 600; }
+.badges { display: flex; gap: 8px; }
+.badge {
+  font-size: 11px; padding: 3px 9px; border-radius: 99px;
+  border: 1px solid var(--line); color: var(--dim);
+}
+.badge.ok { color: var(--good); border-color: #1c4429; background: #0d2417; }
+.badge.bad { color: var(--bad); border-color: #4a2020; background: #24100f; }
+.badge.wait { color: var(--warn); border-color: #463a12; background: #221b08; }
+
+main {
+  max-width: 1180px; margin: 0 auto; padding: 22px;
+  display: flex; flex-direction: column; gap: 18px;
+}
+.panel {
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: 10px; padding: 18px;
+}
+.hint { color: var(--dim); font-size: 12.5px; margin: 0 0 12px; }
+.hint em { color: #6e7681; font-style: normal; }
+
+.row { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+.row > span:first-child { width: 84px; color: var(--dim); font-size: 12.5px; flex: none; }
+.row.check { align-items: flex-start; }
+.row.check span { width: auto; color: var(--fg); font-size: 12.5px; }
+select, input[type=range] { flex: 1; }
+select {
+  background: #0d1117; color: var(--fg); border: 1px solid var(--line);
+  border-radius: 6px; padding: 7px 10px; font: inherit; font-size: 13px;
+}
+input[type=range] { accent-color: var(--accent); }
+output { font-variant-numeric: tabular-nums; color: var(--dim); width: 62px; text-align: right; font-size: 12.5px; }
+.meta { color: var(--dim); font-size: 12px; margin: -4px 0 14px 96px; }
+
+button {
+  background: #21262d; color: var(--fg); border: 1px solid var(--line);
+  border-radius: 6px; padding: 8px 14px; font: inherit; font-size: 13px; cursor: pointer;
+}
+button:hover:not(:disabled) { background: #2d333b; }
+button:disabled { opacity: .45; cursor: default; }
+button.primary { background: #1f6feb; border-color: #1f6feb; }
+button.primary:hover:not(:disabled) { background: #388bfd; }
+.controls { display: flex; gap: 10px; align-items: center; margin-bottom: 16px; flex-wrap: wrap; }
+label.inline { display: flex; align-items: center; gap: 6px; color: var(--dim); font-size: 12.5px; }
+
+.stat-grid { display: flex; flex-wrap: wrap; gap: 8px; }
+.stat {
+  background: #0d1117; border: 1px solid var(--line); border-radius: 6px;
+  padding: 7px 11px; font-size: 12px;
+}
+.stat b { color: var(--fg); font-variant-numeric: tabular-nums; }
+.stat span { color: var(--dim); }
+.stat.good b { color: var(--good); }
+.stat.bad b { color: var(--bad); }
+
+/* 창 비교 */
+.wincmp { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+.tag { font-size: 10px; padding: 2px 6px; border-radius: 4px; font-family: ui-monospace, monospace; }
+.tag.good { background: #0d2417; color: var(--good); }
+.tag.bad { background: #24100f; color: var(--bad); }
+.segs { display: flex; flex-direction: column; gap: 3px; margin-bottom: 10px; }
+.seg {
+  font-size: 11.5px; padding: 4px 8px; border-radius: 4px;
+  background: #0d1117; border-left: 3px solid var(--line);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.seg.past { border-left-color: var(--bad); opacity: .5; }
+.seg.now { border-left-color: var(--good); background: #0d2417; }
+.seg.future { border-left-color: var(--accent); }
+.seg .t { color: var(--dim); font-family: ui-monospace, monospace; margin-right: 8px; }
+.winstat { font-size: 11.5px; color: var(--dim); }
+.winstat b.bad { color: var(--bad); }
+.winstat b.good { color: var(--good); }
+
+/* 경주 */
+.race { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 18px; }
+.lane { background: #0d1117; border: 1px solid var(--line); border-radius: 8px; padding: 14px; }
+.lane.running { border-color: var(--warn); }
+.lane.done { border-color: var(--good); }
+.lane.failed { border-color: var(--bad); }
+.lane h3 { display: flex; justify-content: space-between; margin-bottom: 6px; }
+.lane .n { font-family: ui-monospace, monospace; }
+.timer { font-size: 30px; font-variant-numeric: tabular-nums; letter-spacing: -.02em; }
+.lane-meta { color: var(--dim); font-size: 11.5px; margin-top: 6px; min-height: 32px; }
+
+table.runs { width: 100%; border-collapse: collapse; font-size: 12px; }
+table.runs th, table.runs td {
+  text-align: right; padding: 5px 8px; border-bottom: 1px solid var(--line);
+  font-variant-numeric: tabular-nums;
+}
+table.runs th { color: var(--dim); font-weight: 500; font-size: 11px; }
+table.runs td:nth-child(2), table.runs th:nth-child(2),
+table.runs td:nth-child(3), table.runs th:nth-child(3) { text-align: left; }
+table.runs td.bad { color: var(--bad); }
+table.runs td.good { color: var(--good); }
+.medians { margin-top: 12px; display: flex; flex-wrap: wrap; gap: 8px; }
+
+/* 결과 줄 */
+.lines { display: flex; flex-direction: column; gap: 6px; max-height: 460px; overflow-y: auto; }
+.ln { background: #0d1117; border: 1px solid var(--line); border-radius: 6px; padding: 8px 11px; }
+.ln.empty { border-color: #4a2020; background: #1a0f0f; }
+.ln.long { border-color: #463a12; }
+.ln .time { font-family: ui-monospace, monospace; font-size: 10.5px; color: var(--dim); }
+.ln .o { font-size: 12.5px; margin-top: 2px; }
+.ln .t { font-size: 12.5px; color: #ffe27a; margin-top: 2px; }
+.ln .t:empty::before { content: "(번역 없음)"; color: var(--bad); }
+
+/* 오버레이 무대 */
+.stage {
+  position: relative; background: #000; border-radius: 8px; overflow: hidden;
+  aspect-ratio: 16/9; max-height: 340px; margin: 0 auto 14px; width: 100%;
+  background-image: repeating-linear-gradient(45deg, #0a0a0a 0 12px, #0d0d0d 12px 24px);
+}
+.stage-inner { position: absolute; inset: 0; }
+/* 미리보기 안에서는 오버레이를 무대 기준으로 앉힌다 (실제 페이지에선 fixed) */
+.stage #ytdual-box {
+  position: absolute !important; left: 0 !important; right: 0 !important;
+  bottom: 16px !important; top: auto !important; width: 100% !important;
+}
+
+@media (max-width: 860px) {
+  .wincmp, .race { grid-template-columns: 1fr; }
+}
