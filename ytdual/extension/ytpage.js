@@ -76,7 +76,7 @@
  */
 
 /**
- * @typedef {"ok"|"no-player"|"no-tracks"|"no-pot"|"timeout"|"video-changed"} PageDataReason
+ * @typedef {"ok"|"no-player"|"no-tracks"|"no-pot"|"timeout"|"video-changed"|"cancelled"} PageDataReason
  *
  * 왜 빈 배열 하나로는 안 되나 — "이 영상엔 자막이 없다"와 "플레이어가 아직 준비되지
  *   않았다"가 같은 값이 되면 content.js 가 다음 수를 고를 수 없다. 우리는 이미 똑같은
@@ -89,6 +89,7 @@
  *   no-pot         트랙은 있는데 pot 붙은 url 이 하나도 없다. 정적 경로로 강등한다
  *   timeout        제한 시간 안에 준비되지 않았다
  *   video-changed  뽑는 도중 videoId 가 바뀌었다. 이 응답은 통째로 버려야 한다
+ *   cancelled      요청한 세대가 stop 됐다. 응답하지 않고 폴링을 끝낸다
  *
  * ★ no-tracks 를 "자막 없음"으로 곧장 믿으면 안 된다. 전사(유료)로 가는 판단은
  *   여전히 content.js 의 chooseSource 가 playerResponse 를 보고 내린다.
@@ -114,7 +115,9 @@
  *      뒤에도 갱신되지 않을 수 있다.
  *  I29 여기 담기는 것은 "본 것"뿐이다. 고른 결과나 순위는 담지 않는다.
  *
- * ★ 세계 경계를 넘는 형식은 이 객체가 아니라 이 객체를 JSON.stringify 한 문자열이다.
+ * ★ 세계 경계를 넘는 detail 은 이 객체 자체가 아니라 JSON.stringify(PageData) 한
+ *   문자열이다. requestId 는 응답 이벤트 이름의 접미사로 둔다. 그래야 같은 영상의
+ *   이전 요청이 새 응답을 가로채지 않고, 다른 대기자가 큰 player 객체를 파싱하지 않는다.
  *   MAIN 세계에서 만든 객체를 격리 세계가 그대로 읽는 규칙은 브라우저마다 다르다
  *   (Firefox 는 Xray 로 막고 cloneInto 를 요구한다). Zen 이 주 브라우저이므로
  *   문자열로 통일한다. Chrome 에서는 객체도 통하지만 두 벌을 두지 않는다.
@@ -131,13 +134,14 @@
  *   다른 프레임이나 사이트가 끼어들 수 없다. asbplayer 도 같은 선택을 했다
  *   ('asbplayer-get-synced-data' / 'asbplayer-synced-data').
  *
- * ★ 이 두 문자열은 content.js 에도 같은 값으로 있어야 한다. 세계가 다르면 import 가
+ * ★ 이 세 문자열은 content.js 에도 같은 값으로 있어야 한다. 세계가 다르면 import 가
  *   불가능하므로 중복이 불가피하다 — 이 저장소에서 값이 두 곳에 사는 몇 안 되는
  *   자리다. 한쪽만 고치면 브리지는 오류 없이 조용히 죽고, 증상은 "가끔 자막이 안 뜬다"
  *   로만 보인다. Phase 2 에서 두 값이 같은지 정적 검사로 고정한다.
  */
 const YTDUAL_PAGE_REQ = "ytdual-get-page-data";
 const YTDUAL_PAGE_RES = "ytdual-page-data";
+const YTDUAL_PAGE_CANCEL = "ytdual-cancel-page-data";
 
 /** 런타임 트랙에 pot 이 붙기를 기다릴 상한.
  *
@@ -206,6 +210,7 @@ function readPlayerResponse(videoId) {
  *        쪽이 "트랙이 없다"와 "pot 이 아직 없다"를 구분할 수 없어진다.)
  *
  *  @param {string} videoId  뽑는 도중 영상이 바뀌었는지 볼 기준
+ *  @param {AbortSignal} signal  요청 세대가 끝나면 폴링도 끝낸다
  *  @returns {Promise<{tracks: RawTrack[], reason: PageDataReason}>}
  *
  *  ★ 계획에는 반환을 RawTrack[]|null 로 적었으나 그러면 이유가 사라진다.
@@ -213,11 +218,12 @@ function readPlayerResponse(videoId) {
  *    다르게 다뤄야 한다 — 전자는 전사 후보, 후자는 단순 강등이다. 둘을 null 로
  *    뭉치면 FetchResult 에서 이미 저질렀던 실수(수집 실패와 자막 없음을 같은 값으로
  *    만들어 유료 전사가 오발동)를 새 자리에서 반복하게 된다. */
-async function runtimeTracks(videoId) {
+async function runtimeTracks(videoId, signal) {
   const deadline = Date.now() + PAGE_POLL_MS;
   let seen = [];                 // I29: pot 이 없어도 본 것은 그대로 실어 보낸다
   let why = "no-player";
   for (;;) {
+    if (signal?.aborted) return { tracks: [], reason: "cancelled" };
     if (inferVideoId() !== videoId) return { tracks: [], reason: "video-changed" };
 
     const p = document.querySelector("#movie_player");
@@ -251,13 +257,16 @@ async function runtimeTracks(videoId) {
  *  마지막에 videoId 를 다시 확인해야 한다 — 모으는 사이에 SPA 이동이 일어나면
  *  이 결과는 다른 영상의 것이다. (asbplayer 도 같은 자리에서 같은 검사를 한다.)
  *
+ *  @param {AbortSignal} signal  content 세대가 끝나면 수집도 끝낸다
  *  @returns {Promise<PageData>} 실패해도 예외를 던지지 않는다. reason 에 담아 보낸다 */
-async function collectPageData() {
+async function collectPageData(signal) {
   const videoId = inferVideoId();
   const blank = { videoId: videoId || "", title: "", tracks: [], player: null, client: "" };
   if (!videoId) return { ...blank, reason: "no-player" };
+  if (signal?.aborted) return { ...blank, reason: "cancelled" };
 
-  const { tracks, reason } = await runtimeTracks(videoId);
+  const { tracks, reason } = await runtimeTracks(videoId, signal);
+  if (signal?.aborted) return { ...blank, reason: "cancelled" };
   // I28: 모으는 사이에 SPA 이동이 일어났으면 이 결과는 다른 영상의 것이다.
   if (inferVideoId() !== videoId) return { ...blank, reason: "video-changed" };
 
@@ -284,9 +293,17 @@ async function collectPageData() {
  *
  *  @returns {void} */
 function installBridge() {
-  document.addEventListener(YTDUAL_PAGE_REQ, () => {
-    collectPageData()
-      // 예외가 나도 반드시 응답한다. 침묵하면 content.js 는 상한까지 기다리고,
+  const pending = new Map();
+  document.addEventListener(YTDUAL_PAGE_CANCEL, (event) => {
+    if (typeof event.detail === "string") pending.get(event.detail)?.abort();
+  });
+  document.addEventListener(YTDUAL_PAGE_REQ, (event) => {
+    const requestId = typeof event.detail === "string" ? event.detail : "";
+    if (!requestId || pending.has(requestId)) return;
+    const ctl = new AbortController();
+    pending.set(requestId, ctl);
+    collectPageData(ctl.signal)
+      // 취소가 아닌 예외에는 반드시 응답한다. 침묵하면 content.js 는 상한까지 기다리고,
       // 그 시간은 그대로 사용자가 자막 없이 보는 시간이 된다.
       .catch((e) => ({
         videoId: "", title: "", tracks: [], player: null, client: "",
@@ -294,8 +311,11 @@ function installBridge() {
       }))
       // 객체가 아니라 JSON 문자열로 보낸다 — PageData 주석의 세계 경계 계약 참조.
       .then((data) => {
-        document.dispatchEvent(new CustomEvent(YTDUAL_PAGE_RES, { detail: JSON.stringify(data) }));
-      });
+        if (ctl.signal.aborted) return;
+        const responseEvent = `${YTDUAL_PAGE_RES}:${requestId}`;
+        document.dispatchEvent(new CustomEvent(responseEvent, { detail: JSON.stringify(data) }));
+      })
+      .finally(() => pending.delete(requestId));
   });
 }
 

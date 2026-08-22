@@ -123,9 +123,11 @@ test("★ 두 세계가 같은 채널 이름을 쓴다", () => {
   };
   const req = val(ytpageJs, "YTDUAL_PAGE_REQ");
   const res = val(ytpageJs, "YTDUAL_PAGE_RES");
-  assert.ok(req && res, "ytpage.js 에서 채널 상수를 못 찾았다");
+  const cancel = val(ytpageJs, "YTDUAL_PAGE_CANCEL");
+  assert.ok(req && res && cancel, "ytpage.js 에서 채널 상수를 못 찾았다");
   assert.equal(val(contentJs, "PAGE_REQ"), req, "요청 채널 이름이 두 파일에서 다르다");
   assert.equal(val(contentJs, "PAGE_RES"), res, "응답 채널 이름이 두 파일에서 다르다");
+  assert.equal(val(contentJs, "PAGE_CANCEL"), cancel, "취소 채널 이름이 두 파일에서 다르다");
   // 한쪽만 고치면 브리지는 오류 없이 조용히 죽는다. 증상은 "가끔 자막이 안 뜬다"뿐이다.
 });
 
@@ -161,6 +163,16 @@ test("world:MAIN 을 지원하는 Firefox 버전을 요구한다", () => {
  *  방해가 된다. 검사 대상은 "페이지 세계가 실제로 무엇을 하는가"다. */
 const stripComments = (src) =>
   src.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/(^|[^:])\/\/.*$/gm, "$1");
+
+test("★ I7 — 페이지 세계 수집도 현재 세대의 중단 신호로 끊는다", () => {
+  const code = stripComments(contentJs);
+  const startAt = code.indexOf("async function start");
+  const stopAt = code.indexOf("function stop(", startAt);
+  const start = code.slice(startAt, stopAt);
+  const stop = code.slice(stopAt, code.indexOf("function toggle", stopAt));
+  assert.match(start, /requestPageData\(sig\)/, "페이지 요청에 현재 세대의 signal 을 넘기지 않는다");
+  assert.match(stop, /state\.abort\?\.abort\(\)/, "stop 이 현재 세대를 abort 하지 않는다");
+});
 
 test("★ I29 — 페이지 세계는 트랙을 고르지 않는다", () => {
   // 선택 로직이 이쪽으로 새면 node 테스트가 실물의 절반만 보게 된다.

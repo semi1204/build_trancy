@@ -454,11 +454,12 @@ function panelTrack(player) {
  * 응답이라 pot 이 없고, pot 없는 timedtext 는 200 + 빈 본문이 온다. 플레이어가
  * 초기화된 뒤 노출하는 런타임 URL 에만 pot 이 붙는다.
  *
- * ★ 이 두 문자열은 ytpage.js 에도 같은 값으로 있다. 세계가 달라 import 가
+ * ★ 이 세 문자열은 ytpage.js 에도 같은 값으로 있다. 세계가 달라 import 가
  *   불가능하므로 중복이 불가피하다. 한쪽만 고치면 브리지는 오류 없이 조용히
  *   죽고 증상은 "가끔 자막이 안 뜬다"로만 보인다. 정적 검사로 묶어야 한다. */
 const PAGE_REQ = "ytdual-get-page-data";
 const PAGE_RES = "ytdual-page-data";
+const PAGE_CANCEL = "ytdual-cancel-page-data";
 
 /** 페이지 세계가 준비될 때까지 기다릴 상한.
  *  requestPageData 의 인자로 두지 않은 이유 — 호출부가 하나뿐이고 값도 하나다.
@@ -475,27 +476,37 @@ const PAGE_DATA_TIMEOUT_MS = 5000;
 
 /** 페이지 세계에 자료를 요청한다. CustomEvent 왕복 1회.
  *
- *  @returns {Promise<PageData|null>} 브리지가 없거나 늦으면 null.
+ *  @param {AbortSignal} signal  stop() 이 이 세대의 리스너와 타이머도 즉시 걷는다.
+ *  @returns {Promise<PageData|null>} 브리지가 없거나 늦거나 세대가 끝나면 null.
  *    null 은 실패가 아니라 "강등"이다 — 호출부는 지금까지 하던 대로
  *    fetchPlayerResponse + baseUrl 로 진행해야 한다. 새 실패 모드를 만들지 않는다.
  *
  *  ★ 반환된 PageData.videoId 를 호출부가 반드시 대조해야 한다. 세계 사이 왕복 중에
  *    SPA 이동이 일어날 수 있다. */
-async function requestPageData() {
+async function requestPageData(signal) {
+  // 문서 전역 채널이다. dev/stable 두 인스턴스가 함께 있어도 ID 가 겹치면 안 된다.
+  const requestId = crypto.randomUUID();
+  const responseEvent = `${PAGE_RES}:${requestId}`;
   return new Promise((resolve) => {
     let settled = false;
     const finish = (v) => {
-      if (settled) return;                    // 응답과 타임아웃이 겹칠 수 있다
+      if (settled) return;                    // 응답·중단·타임아웃이 겹칠 수 있다
       settled = true;
       clearTimeout(timer);
-      document.removeEventListener(PAGE_RES, onRes);
+      document.removeEventListener(responseEvent, onRes);
+      signal?.removeEventListener("abort", onAbort);
       resolve(v);
     };
-    // detail 은 JSON 문자열이다 (ytpage.js 의 세계 경계 계약). 못 읽으면 강등한다.
     const onRes = (e) => { try { finish(JSON.parse(e.detail)); } catch { finish(null); } };
-    const timer = setTimeout(() => finish(null), PAGE_DATA_TIMEOUT_MS);   // I26
-    document.addEventListener(PAGE_RES, onRes);
-    document.dispatchEvent(new CustomEvent(PAGE_REQ));
+    const cancelPage = () => {
+      document.dispatchEvent(new CustomEvent(PAGE_CANCEL, { detail: requestId }));
+    };
+    const onAbort = () => { cancelPage(); finish(null); };
+    const timer = setTimeout(() => { cancelPage(); finish(null); }, PAGE_DATA_TIMEOUT_MS);   // I26
+    document.addEventListener(responseEvent, onRes);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) { finish(null); return; }
+    document.dispatchEvent(new CustomEvent(PAGE_REQ, { detail: requestId }));
   });
 }
 
@@ -1359,7 +1370,7 @@ async function start() {
     showStatus("자막 트랙 확인 중", true);
     // 페이지 세계가 pot 붙은 런타임 트랙과 ytInitialPlayerResponse 를 함께 준다.
     // 없거나 늦으면 null 이고, 그때는 지금까지 하던 대로 진행한다 (I25).
-    const page = await requestPageData();
+    const page = await requestPageData(sig);
     if (myGen !== state.gen) return;                            // I24
     // I28: 왕복 중 SPA 이동이 있었으면 남의 영상 자료다. 대조 전에는 쓰지 않는다.
     const pageOk = !!page && page.videoId === videoId;

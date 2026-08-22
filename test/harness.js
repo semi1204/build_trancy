@@ -45,6 +45,8 @@ const EPILOGUE = `
   pickTrack,
   runtimeUrlFor,
   parseTimestamp,
+  requestPageData,
+  get document() { return document; },
 };
 `;
 
@@ -53,6 +55,7 @@ const EPILOGUE = `
  *  조용히 삼켜져서 통과한 이유를 신뢰할 수 없다. */
 function makeSandbox() {
   const noop = () => {};
+  let uuidSeq = 0;
   const el = {
     classList: { add: noop, remove: noop, contains: () => false },
     style: {},
@@ -66,7 +69,12 @@ function makeSandbox() {
   };
   const sandbox = {
     console,
-    crypto: { randomUUID: () => "00000000-0000-4000-8000-000000000000" },
+    CustomEvent: class {
+      constructor(type, options = {}) { this.type = type; this.detail = options.detail; }
+    },
+    crypto: {
+      randomUUID: () => `00000000-0000-4000-8000-${String(++uuidSeq).padStart(12, "0")}`,
+    },
     performance: { now: () => 0 },
     setTimeout: () => 0,
     clearTimeout: noop,
@@ -109,9 +117,12 @@ function makeSandbox() {
 
 /** content.js 를 새 컨텍스트에서 실행하고 내부를 반환한다.
  *  테스트마다 새로 부를 것 — 모듈 수준 state 가 공유되면 안 된다. */
-export function loadContent() {
+export function loadContent(overrides = {}) {
   const src = readFileSync(CONTENT_JS, "utf8");
-  const sandbox = makeSandbox();
+  const sandbox = Object.assign(makeSandbox(), overrides);
+  sandbox.window = sandbox;
+  sandbox.globalThis = sandbox;
+  sandbox.self = sandbox;
   vm.createContext(sandbox);
   new vm.Script(src + EPILOGUE, { filename: "content.js" }).runInContext(sandbox);
   const api = sandbox.__ytdual__;
