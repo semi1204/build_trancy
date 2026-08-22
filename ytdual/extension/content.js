@@ -905,6 +905,76 @@ function mergeTranslated(lines, t0, t1) {
   state.idx = -2;
 }
 
+/* ── 번역 작업 스케줄링 ──────────────────────────────────────────────
+ * 순수 함수로 빼 둔 이유: start() 안에 두면 브라우저 하네스와 테스트가 같은
+ * 로직을 베껴 갖게 되고, 베낀 순간부터 둘이 갈라진다. 여기 있으면 실코드를
+ * 그대로 부를 수 있다. */
+
+/**
+ * @typedef {object} Job  번역 작업 하나. segments 의 연속 구간이며 시간 구간
+ *   [t0,t1] 을 소유한다. 구간이 서로 겹치지 않는 한 mergeTranslated 가 각자
+ *   자리만 교체하므로, 작업을 쪼개도 병합이 서로를 침범하지 않는다.
+ * @property {number}    i0    segments 에서의 시작 인덱스
+ * @property {Segment[]} segs
+ * @property {number}    t0
+ * @property {number}    t1
+ */
+
+/** @returns {Job} */
+function makeJob(i0, segs) {
+  return { i0, segs, t0: segs[0].start, t1: segs[segs.length - 1].end };
+}
+
+/** segments 를 size 조각씩 잘라 작업 목록을 만든다. @returns {Job[]} */
+function makeJobs(segments, size) {
+  const jobs = [];
+  for (let i = 0; i < segments.length; i += size) jobs.push(makeJob(i, segments.slice(i, i + size)));
+  return jobs;
+}
+
+/** 재생 위치가 이 작업 구간 안인가. 5초 선행은 "곧 닿는다"로 본다. */
+function isPlayingJob(j, t) {
+  return t >= j.t0 - 5 && t <= j.t1;
+}
+
+/**
+ * 다음에 번역할 작업을 고른다. 고정 순서가 아니라 "매번" 현재 재생 위치로 다시
+ * 고른다 — 시킹해도 다음 요청부터 그 지점이 최우선이 된다.
+ * @returns {{job: Job, playing: boolean}|null}
+ */
+function pickJob(pending, t) {
+  let best = null, bestScore = Infinity;
+  for (const j of pending) {
+    const sc = isPlayingJob(j, t) ? -1     // 지금 재생 중인 작업 최우선
+      : j.t0 >= t ? j.t0 - t               // 앞쪽은 가까운 순서
+      : 1e6 + (t - j.t0);                  // 지나간 쪽은 맨 뒤
+    if (sc < bestScore) { bestScore = sc; best = j; }
+  }
+  return best && { job: best, playing: bestScore === -1 };
+}
+
+/**
+ * 재생 중인 작업을 "지금 보는 몇 조각"과 나머지로 쪼갠다.
+ *
+ * 지연은 출력 토큰이 만든다 — 조각이 적을수록 빨리 온다.
+ *   [실측 VBMUMuZBxw0 재생 지점 부근 5회: N=3 2.3초 / N=4 3.1초 / N=8 4.4초 /
+ *    N=12 5.9초. 입력 토큰은 608→688 로 거의 안 변한다 (문맥이 대부분이라)]
+ * 그래서 배경은 큰 조각으로 효율을 취하고, 지금 보고 있는 구간만 잘게 잘라
+ * 먼저 띄운다. 셋 다 시간 구간이 겹치지 않으므로 병합이 안전하다.
+ *
+ * @returns {{head: Job, rest: Job[]}} 쪼갤 필요가 없으면 head 가 원본이고 rest 는 빈 배열
+ */
+function splitJobAt(job, t, size) {
+  if (job.segs.length <= size) return { head: job, rest: [] };
+  let p = job.segs.findIndex((s) => s.end >= t);
+  if (p < 0) p = 0;
+  const head = makeJob(job.i0 + p, job.segs.slice(p, p + size));
+  const rest = [];
+  if (p > 0) rest.push(makeJob(job.i0, job.segs.slice(0, p)));
+  if (p + size < job.segs.length) rest.push(makeJob(job.i0 + p + size, job.segs.slice(p + size)));
+  return { head, rest };
+}
+
 function findLine(t) {
   const L = state.lines;
   let lo = 0, hi = L.length - 1, best = -1;
@@ -1046,58 +1116,15 @@ async function start() {
     // 긴 자막을 한 요청으로 보내면 응답까지 몇 분씩 걸려 연결이 끊긴다.
     // 작은 청크로 나눠, "지금 보고 있는 지점"부터 번역해 바로 띄우고 나머지는
     // 백그라운드로 채운다. 이웃 세그먼트는 문맥(CTX)으로 함께 보낸다.
-    //
-    // 지연은 출력 토큰이 만든다 — 조각이 적을수록 빨리 온다.
-    //   [실측 VBMUMuZBxw0, 재생 지점 부근 5회]
-    //     N=3  중앙 2.3초   N=4  3.1초   N=8  4.4초   N=12  5.9초
-    //     입력 토큰은 608→688 로 거의 안 변한다 (문맥이 대부분이라).
-    // 그래서 배경은 12조각으로 효율을 취하고, 지금 보고 있는 구간만 잘게 잘라
-    // 먼저 띄운다.
+    // 재생 지점 우선 슬라이스의 근거는 splitJobAt 주석 참조.
     const TRANSLATE_CHUNK = 12;
     const PRIORITY_SLICE = 4;     // 재생 지점을 덮는 몇 조각을 먼저 번역할지
     state.perf.segsPerChunk = TRANSLATE_CHUNK;
     const CTX_N = 8;
 
-    /** 번역 작업 하나. segments 의 연속 구간이며, 시간 구간 [t0,t1] 을 소유한다.
-     *  구간이 서로 겹치지 않는 한 mergeTranslated 가 각자 자리만 교체한다. */
-    const mkJob = (i0, segs) =>
-      ({ i0, segs, t0: segs[0].start, t1: segs[segs.length - 1].end });
-
-    const pending = new Set();
-    for (let i = 0; i < segments.length; i += TRANSLATE_CHUNK) {
-      pending.add(mkJob(i, segments.slice(i, i + TRANSLATE_CHUNK)));
-    }
+    const pending = new Set(makeJobs(segments, TRANSLATE_CHUNK));
     let total = pending.size;
-
-    // 우선순위는 고정 순서가 아니라 "매 작업마다" 현재 재생바 위치로 다시
-    // 고른다 — 시킹해도 다음 요청부터 그 지점이 최우선이 된다.
     const playhead = () => $("video")?.currentTime || 0;
-    const isPlaying = (j, t) => t >= j.t0 - 5 && t <= j.t1;
-    const nextJob = () => {
-      const t = playhead();
-      let best = null, bestScore = Infinity;
-      for (const j of pending) {
-        const sc = isPlaying(j, t) ? -1        // 지금 재생 중인 작업 최우선
-          : j.t0 >= t ? j.t0 - t               // 앞쪽은 가까운 순서
-          : 1e6 + (t - j.t0);                  // 지나간 쪽은 맨 뒤
-        if (sc < bestScore) { bestScore = sc; best = j; }
-      }
-      return best && { j: best, playing: bestScore === -1 };
-    };
-
-    /** 재생 중인 작업을 "지금 보는 몇 조각"과 나머지로 쪼갠다.
-     *  세 조각 모두 시간이 겹치지 않으므로 병합이 서로를 침범하지 않는다.
-     *  @returns {object|null} 먼저 번역할 조각. 쪼갤 필요가 없으면 null */
-    const splitForPlayhead = (j) => {
-      if (j.segs.length <= PRIORITY_SLICE) return null;
-      let p = j.segs.findIndex((s) => s.end >= playhead());
-      if (p < 0) p = 0;
-      const head = mkJob(j.i0 + p, j.segs.slice(p, p + PRIORITY_SLICE));
-      for (const rest of [j.segs.slice(0, p), j.segs.slice(p + PRIORITY_SLICE)]) {
-        if (rest.length) { pending.add(mkJob(j.i0 + j.segs.indexOf(rest[0]), rest)); total++; }
-      }
-      return head;
-    };
 
     // 시킹하면 지금 보는 곳과 무관해진 요청을 끊는다. 안 끊으면 runner 8개가
     // 옛 재생 위치 작업을 붙잡고 있어, 새 지점은 하나가 빌 때까지 기다린 뒤에야
@@ -1106,7 +1133,7 @@ async function start() {
     const inflight = new Map();
     const onSeek = () => {
       const t = playhead();
-      for (const [j, ctl] of inflight) if (!isPlaying(j, t)) ctl.abort();
+      for (const [j, ctl] of inflight) if (!isPlayingJob(j, t)) ctl.abort();
     };
     $("video")?.addEventListener("seeked", onSeek);
     cleanups.push(() => $("video")?.removeEventListener("seeked", onSeek));
@@ -1117,13 +1144,14 @@ async function start() {
     const runner = async () => {
       for (;;) {
         if (state.gen !== myGen || !state.active) return;   // I6
-        const picked = nextJob();
+        const picked = pickJob(pending, playhead());
         if (!picked) return;
-        let { j, playing } = picked;
+        let j = picked.job;
         pending.delete(j);
-        if (playing) {
-          const head = splitForPlayhead(j);
-          if (head) j = head;
+        if (picked.playing) {
+          const { head, rest } = splitJobAt(j, playhead(), PRIORITY_SLICE);
+          for (const r of rest) { pending.add(r); total++; }
+          j = head;
         }
         // 이 작업만 끊을 수 있는 손잡이. 세션 전체 중단(sig)과 함께 건다.
         const ctl = new AbortController();

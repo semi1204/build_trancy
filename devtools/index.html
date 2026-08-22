@@ -2,7 +2,7 @@
 <html lang="ko">
 <head>
 <meta charset="utf-8">
-<title>YT Dual — 자막 파이프라인 테스트</title>
+<title>YT Dual 하네스</title>
 <link rel="stylesheet" href="/overlay.css">
 <link rel="stylesheet" href="/app.css">
 </head>
@@ -11,102 +11,87 @@
 <header>
   <h1>YT Dual 자막 파이프라인</h1>
   <div class="badges">
-    <span id="health" class="badge wait">워커 확인 중…</span>
-    <span id="srcbadge" class="badge ok">실제 content.js 로드됨</span>
+    <span id="src" class="badge wait">content.js 확인 중</span>
+    <span id="worker" class="badge wait">워커 확인 중</span>
   </div>
 </header>
 
 <main>
-  <!-- ── 입력 ───────────────────────────────────────────────── -->
-  <section class="panel" id="panel-input">
-    <h2>1 · 자막과 재생 지점</h2>
 
-    <label class="row">
-      <span>자막</span>
-      <select id="fixture"></select>
-    </label>
+<!-- 1 · 자막 ─────────────────────────────────────────────── -->
+<section class="card">
+  <h2>1 · 자막</h2>
+  <div class="row">
+    <select id="fixture"></select>
+    <label class="chk"><input type="checkbox" id="normalize" checked> 시간 정규화</label>
+  </div>
+  <div class="sub" id="fixture-title">—</div>
+  <div class="stats" id="stats-source"></div>
+</section>
 
-    <div class="meta" id="fixture-meta">—</div>
+<!-- 2 · 번역 ─────────────────────────────────────────────── -->
+<section class="card">
+  <h2>2 · 번역</h2>
+  <p class="hint">
+    재생 위치를 옮기고 <b>여기서 시작</b>을 누르면, 확장과 똑같이 8개를 동시에
+    돌려 그 지점부터 번역합니다. 타이머는 <b>그 지점 자막이 화면에 뜨기까지</b>를 잽니다.
+  </p>
 
-    <label class="row">
-      <span>재생 위치</span>
-      <input type="range" id="playhead" min="0" max="100" step="0.1" value="0">
-      <output id="playhead-out">0:00</output>
-    </label>
+  <div class="row">
+    <span class="lbl">재생 위치</span>
+    <input type="range" id="play" min="0" max="100" step="0.1" value="0">
+    <output id="play-out">0:00</output>
+  </div>
 
-    <label class="row check">
-      <input type="checkbox" id="normalize" checked>
-      <span>시간 정규화 적용 <em>(normalizeSegments — 자동자막 rolling 겹침 제거)</em></span>
-    </label>
+  <div class="row btns">
+    <button id="run" class="primary">여기서 시작</button>
+    <button id="seek" disabled>여기로 시킹</button>
+    <button id="stop" disabled>중지</button>
+    <label class="chk"><input type="checkbox" id="bust" checked> 캐시 우회</label>
+  </div>
 
-    <div class="stat-grid" id="norm-stats"></div>
-  </section>
+  <div class="gauge" id="gauge">
+    <div class="gauge-num"><span id="timer">—</span><small>초</small></div>
+    <div class="gauge-bar"><i id="bar"></i><u>3초</u></div>
+    <div class="gauge-note" id="gauge-note">대기 중</div>
+  </div>
 
-  <!-- ── 실행 ───────────────────────────────────────────────── -->
-  <section class="panel" id="panel-race">
-    <h2>2 · 번역 실행</h2>
-    <div class="controls">
-      <button id="run" class="primary">이 지점 청크 번역</button>
-      <button id="run-full-grid">전체 번역</button>
-      <button id="clear">기록 지우기</button>
-      <label class="inline"><input type="checkbox" id="bust" checked> 캐시 우회</label>
-    </div>
+  <div class="stats" id="stats-run"></div>
+  <div class="progress"><i id="prog"></i></div>
+  <div class="sub" id="prog-note">—</div>
+</section>
 
-    <div class="race">
-      <div class="lane" id="lane-one">
-        <h3>이 청크 <span class="n">N=12</span></h3>
-        <div class="timer" id="timer-one">—</div>
-        <div class="lane-meta" id="meta-one"></div>
-      </div>
-    </div>
+<!-- 3 · 화면 ─────────────────────────────────────────────── -->
+<section class="card">
+  <h2>3 · 화면에 뜨는 자막</h2>
+  <p class="hint">실제 <code>overlay.css</code> 와 실제 <code>findLine()</code> 으로 그립니다.</p>
+  <div class="stage">
+    <div id="ytdual-box"><div id="ytdual-orig"></div><div id="ytdual-trans"></div></div>
+  </div>
+  <div class="row">
+    <span class="lbl">미리보기</span>
+    <input type="range" id="preview" min="0" max="100" step="0.05" value="0">
+    <output id="preview-out">0:00</output>
+    <button id="follow" class="small on">재생 위치 따라가기</button>
+  </div>
+  <div class="stats" id="stats-preview"></div>
+</section>
 
-    <table class="runs" id="runs">
-      <thead><tr>
-        <th>#</th><th>자막</th><th>N</th><th>ms</th>
-        <th>출력토큰</th><th>reasoning</th><th>빈번역</th><th>구멍</th><th>최장줄</th>
-      </tr></thead>
-      <tbody></tbody>
-    </table>
-    <div class="medians" id="medians"></div>
-  </section>
+<!-- 4 · 줄 ───────────────────────────────────────────────── -->
+<section class="card">
+  <h2>4 · 번역된 줄</h2>
+  <div class="stats" id="stats-lines"></div>
+  <div class="lines" id="lines"></div>
+</section>
 
-  <!-- ── 결과 ───────────────────────────────────────────────── -->
-  <section class="panel" id="panel-lines">
-    <h2>3 · 번역 결과</h2>
-    <div class="hint" id="lines-hint">아직 실행하지 않았습니다.</div>
-    <div class="lines" id="lines"></div>
-  </section>
-
-  <!-- ── 오버레이 ───────────────────────────────────────────── -->
-  <section class="panel" id="panel-preview">
-    <h2>4 · 자막 오버레이 미리보기</h2>
-    <p class="hint">
-      실제 overlay.css 와 실제 findLine() 으로 그린다. 슬라이더를 끌면 그 시각에
-      화면에 뜨는 자막이 그대로 보인다 — 비는 순간이 있으면 여기서 드러난다.
-    </p>
-    <div class="stage" id="stage">
-      <div class="stage-inner">
-        <div id="ytdual-box"><div id="ytdual-orig"></div><div id="ytdual-trans"></div></div>
-      </div>
-    </div>
-    <label class="row">
-      <span>미리보기 시각</span>
-      <input type="range" id="preview" min="0" max="100" step="0.05" value="0">
-      <output id="preview-out">0:00</output>
-    </label>
-    <div class="stat-grid" id="preview-stats"></div>
-  </section>
 </main>
 
-<!-- content.js 는 확장 환경을 기대한다. 최소 스텁을 먼저 깔고 원본을 그대로 실행한다.
-     (사본을 만들면 여기서 본 동작과 출하물이 갈라진다) -->
+<!-- content.js 는 확장 환경을 기대한다. 최소 스텁을 먼저 깔고 원본을 그대로
+     실행한다. 사본을 만들면 여기서 본 동작과 출하물이 갈라진다. -->
 <script>
 window.browser = {
   storage: {
-    local: {
-      get: async () => ({ endpoint: location.origin, target: "Korean", autoStart: false }),
-      set: async () => {},
-    },
+    local: { get: async () => ({ endpoint: location.origin, target: "Korean", autoStart: false }), set: async () => {} },
     onChanged: { addListener: () => {} },
   },
   runtime: { sendMessage: async () => ({}), onMessage: { addListener: () => {} } },

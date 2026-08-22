@@ -1,23 +1,28 @@
-/* 브라우저 테스트 하네스.
+/* 브라우저 하네스.
  *
- * 이 파일은 자막 로직을 다시 구현하지 않는다. /content.js 로 로드된 실제 확장
- * 소스의 함수를 그대로 부른다 — normalizeSegments, pickTrack, seedRawLines,
- * mergeTranslated, findLine, requestTranslation.
- * (classic script 의 최상위 function 선언과 let/const 는 같은 realm 의 다음
- *  스크립트에서 이름으로 접근된다. 그래서 사본 없이 실코드를 쓸 수 있다.)
+ * 자막 로직을 다시 구현하지 않는다. /content.js 로 로드된 실제 확장 소스의
+ * 함수를 그대로 부른다:
+ *   normalizeSegments  시간 정규화
+ *   makeJobs pickJob splitJobAt   작업 분할·우선순위·재생 지점 슬라이스
+ *   seedRawLines mergeTranslated  state.lines 조립
+ *   findLine                      화면에 뜰 줄 찾기
+ *   requestTranslation            워커 호출 (타임아웃·계약 검사 포함)
  *
  * 재구현하면 여기서 초록불인데 출하물은 빨간불인 상태가 생긴다. 그건 테스트가
- * 아니라 착시다.
+ * 아니라 착시다. 여기 남은 것은 "8개를 동시에 돌린다"는 루프뿐이고, 그 안의
+ * 판단은 전부 위 함수들이 한다.
+ *
+ * IIFE 로 감싸는 이유: classic script 의 최상위 let/const 는 전역 렉시컬 환경을
+ * 공유한다. content.js 가 이미 `const $` 를 선언하므로 겹치면 페이지가 통째로 죽는다.
  */
 "use strict";
-
-/* IIFE 로 감싸는 이유: classic script 의 최상위 let/const 는 같은 realm 의 전역
- * 렉시컬 환경을 공유한다. content.js 가 이미 `const $` 를 선언하므로, 여기서
- * 같은 이름을 최상위에 두면 SyntaxError 로 페이지가 통째로 죽는다 (실제로 죽었다).
- * 감싸면 이 파일의 이름은 지역이 되고, content.js 의 cfg·state·함수들은
- * 스코프 체인을 타고 그대로 보인다. */
 (function () {
 
+const RUNNERS = 8;          // content.js 와 같은 값
+const CHUNK = 12;           // TRANSLATE_CHUNK
+const SLICE = 4;            // PRIORITY_SLICE
+const CTX_N = 8;
+const GOAL_MS = 3000;       // 게이지의 목표선
 
 const $ = (s) => document.querySelector(s);
 const el = (tag, cls, txt) => {
@@ -26,51 +31,37 @@ const el = (tag, cls, txt) => {
   if (txt != null) n.textContent = txt;
   return n;
 };
-const fmt = (s) => {
-  const m = Math.floor(s / 60), r = Math.floor(s % 60);
-  return `${m}:${String(r).padStart(2, "0")}`;
+const clock = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
+const stat = (label, value, cls = "") => {
+  const n = el("div", `stat ${cls}`);
+  n.append(el("span", null, label), el("b", null, String(value)));
+  return n;
 };
-const median = (a) => {
-  if (!a.length) return null;
-  const s = [...a].sort((x, y) => x - y);
-  const m = s.length >> 1;
-  return s.length % 2 ? s[m] : Math.round((s[m - 1] + s[m]) / 2);
-};
-
-/* content.js 가 기대하는 것 중 이 페이지에 없는 것들.
- * <video> 는 실제로 없지만 findLine 은 시각만 필요하다. */
-const TRANSLATE_CHUNK = 12;
-const CTX_N = 8;
 
 const S = {
-  fixtures: [],
-  fx: null,          // 현재 fixture 메타
-  raw: [],           // 원본 세그먼트
-  segs: [],          // 정규화 적용 여부가 반영된 세그먼트
-  chunks: [],
-  runs: [],
+  fixtures: [], fx: null,
+  segments: [],          // 정규화 반영된 조각
+  session: null,         // { pending, inflight, stop, t0, target, done, total }
+  follow: true,
   seq: 0,
-  busy: false,
 };
 
-/* ── 부팅 ─────────────────────────────────────────────────────── */
+/* ── 부팅 ───────────────────────────────────────────────────── */
 async function boot() {
-  // content.js 가 로드됐는지 — 없으면 나머지는 전부 거짓말이 된다
-  const need = ["normalizeSegments", "pickTrack", "seedRawLines",
-                "mergeTranslated", "findLine", "requestTranslation"];
+  const need = ["normalizeSegments", "makeJobs", "pickJob", "splitJobAt", "isPlayingJob",
+                "seedRawLines", "mergeTranslated", "findLine", "requestTranslation", "pickTrack"];
   const missing = need.filter((n) => typeof window[n] !== "function");
-  const badge = $("#srcbadge");
+  const b = $("#src");
   if (missing.length) {
-    badge.className = "badge bad";
-    badge.textContent = `content.js 미연결 (${missing.join(", ")})`;
+    b.className = "badge bad";
+    b.textContent = `content.js 미연결: ${missing.join(", ")}`;
   } else {
-    badge.className = "badge ok";
-    badge.textContent = `실제 content.js 함수 ${need.length}/${need.length} 연결`;
-    badge.title = need.join(", ");
+    b.className = "badge ok";
+    b.textContent = `실제 content.js 함수 ${need.length}개 연결`;
+    b.title = need.join(", ");
   }
 
-  // 실제 cfg 를 이 서버로 돌린다 (프록시가 워커로 넘긴다)
-  cfg.endpoint = location.origin;
+  cfg.endpoint = location.origin;   // content.js 의 cfg — 프록시가 워커로 넘긴다
   cfg.target = "Korean";
 
   health();
@@ -83,313 +74,284 @@ async function boot() {
     return;
   }
   for (const f of S.fixtures) {
-    const kind = f.subtitleKind === "manual" ? "수동" : "자동";
-    sel.append(new Option(`${kind} · ${f.lang} · ${f.count}조각 · ${f.title.slice(0, 46)}`, f.id));
+    const kind = f.subtitleKind === "manual" ? "사람" : "자동";
+    sel.append(new Option(`${kind} · ${f.lang} · ${f.count}조각 · ${f.title.slice(0, 44)}`, f.id));
   }
+
   sel.addEventListener("change", () => loadFixture(sel.value));
-  $("#normalize").addEventListener("change", () => applyNormalize());
-  $("#playhead").addEventListener("input", onPlayhead);
-  $("#preview").addEventListener("input", drawPreview);
-  $("#run").addEventListener("click", runRace);
-  $("#run-full-grid").addEventListener("click", runWholeGrid);
-  $("#clear").addEventListener("click", () => { S.runs = []; drawRuns(); });
+  $("#normalize").addEventListener("change", applyFixture);
+  $("#play").addEventListener("input", onPlay);
+  $("#preview").addEventListener("input", () => { S.follow = false; syncFollow(); draw(); });
+  $("#follow").addEventListener("click", () => { S.follow = !S.follow; syncFollow(); onPlay(); });
+  $("#run").addEventListener("click", () => startSession(false));
+  $("#seek").addEventListener("click", () => startSession(true));
+  $("#stop").addEventListener("click", stopSession);
 
   await loadFixture(S.fixtures[0].id);
 }
 
 async function health() {
-  const b = $("#health");
+  const b = $("#worker");
   try {
     const h = await (await fetch("/api/health")).json();
     b.className = `badge ${h.worker ? "ok" : "bad"}`;
-    b.textContent = h.worker ? `워커 연결됨 ${h.workerUrl}` : `워커 꺼짐 — npm run dev`;
-    $("#run").disabled = !h.worker;
-    $("#run-full-grid").disabled = !h.worker;
+    b.textContent = h.worker ? "워커 연결됨" : "워커 꺼짐 — npm run dev";
+    $("#run").disabled = !h.worker || !!S.session;
   } catch {
     b.className = "badge bad";
-    b.textContent = "테스트 서버 응답 없음";
+    b.textContent = "하네스 서버 없음";
   }
 }
 
-/* ── fixture ──────────────────────────────────────────────────── */
+/* ── 자막 ───────────────────────────────────────────────────── */
 async function loadFixture(id) {
+  stopSession();
   S.fx = S.fixtures.find((f) => f.id === id);
   const d = await (await fetch(`/api/fixtures/${encodeURIComponent(id)}`)).json();
   S.raw = d.segments;
-  $("#fixture-meta").textContent =
-    `${S.fx.title} · ${S.fx.durationSeconds}초 · ${S.fx.subtitleKind === "manual" ? "사람이 단 자막" : "자동생성 자막"}`;
-  applyNormalize();
+  $("#fixture-title").textContent =
+    `${S.fx.title} · ${clock(S.fx.durationSeconds)} · ` +
+    (S.fx.subtitleKind === "manual" ? "사람이 만든 자막" : "자동생성 자막");
+  applyFixture();
 }
 
-/** 정규화 on/off 를 반영하고 겹침 통계를 다시 그린다 */
-function applyNormalize() {
+function applyFixture() {
+  stopSession();
   const on = $("#normalize").checked;
-  S.segs = on ? normalizeSegments(S.raw, S.fx.durationSeconds) : S.raw;
+  S.segments = on ? normalizeSegments(S.raw, S.fx.durationSeconds) : S.raw;
 
-  const ov = (segs) => {
-    let c = 0, m = 0;
-    for (let i = 1; i < segs.length; i++) {
-      const d = segs[i - 1].end - segs[i].start;
-      if (d > 1e-9) { c++; m = Math.max(m, d); }
+  const overlaps = (a) => {
+    let n = 0, max = 0;
+    for (let i = 1; i < a.length; i++) {
+      const d = a[i - 1].end - a[i].start;
+      if (d > 1e-9) { n++; max = Math.max(max, d); }
     }
-    return { c, m };
+    return { n, max };
   };
-  const before = ov(S.raw), after = ov(S.segs);
-  const durs = S.segs.map((s) => s.end - s.start).sort((a, b) => a - b);
+  const before = overlaps(S.raw), after = overlaps(S.segments);
+  const jobs = makeJobs(S.segments, CHUNK);
 
-  $("#norm-stats").replaceChildren(
-    stat("조각", S.segs.length),
-    stat("겹치는 쌍", `${before.c} → ${after.c}`, after.c === 0 && before.c > 0 ? "good" : after.c ? "bad" : ""),
-    stat("최대 겹침", `${before.m.toFixed(2)}s → ${after.m.toFixed(2)}s`, after.m < 0.01 ? "good" : "bad"),
-    stat("중앙 길이", `${durs[durs.length >> 1].toFixed(2)}s`),
+  $("#stats-source").replaceChildren(
+    stat("조각", S.segments.length),
+    stat("작업", jobs.length),
+    stat("겹침", `${before.n} → ${after.n}`,
+      after.n === 0 && before.n > 0 ? "good" : after.n ? "bad" : ""),
+    stat("최대 겹침", `${before.max.toFixed(2)} → ${after.max.toFixed(2)}s`),
   );
 
-  S.chunks = [];
-  for (let i = 0; i < S.segs.length; i += TRANSLATE_CHUNK) {
-    const segs = S.segs.slice(i, i + TRANSLATE_CHUNK);
-    S.chunks.push({ i0: i, segs, t0: segs[0].start, t1: segs[segs.length - 1].end });
-  }
-
-  const dur = S.segs[S.segs.length - 1].end;
-  for (const id of ["#playhead", "#preview"]) {
+  const dur = S.segments[S.segments.length - 1].end;
+  for (const id of ["#play", "#preview"]) {
     const r = $(id);
     r.max = dur.toFixed(2);
     if (+r.value > dur) r.value = 0;
   }
-  // 원문만 깔아 둔다 — 실제 seedRawLines 를 그대로 쓴다 (I1)
-  seedRawLines(S.segs);
-  onPlayhead();
-  drawPreview();
+  seedRawLines(S.segments);        // 원문만 깔아 둔다 (I1)
+  onPlay();
+  renderLines();
 }
 
-const stat = (label, value, cls = "") => {
-  const n = el("div", `stat ${cls}`);
-  n.append(el("span", null, `${label} `), el("b", null, String(value)));
-  return n;
-};
+function onPlay() {
+  const t = +$("#play").value;
+  $("#play-out").textContent = clock(t);
+  if (S.follow) { $("#preview").value = t; }
+  draw();
+}
+const syncFollow = () => $("#follow").classList.toggle("on", S.follow);
 
-/* ── 창 비교 ──────────────────────────────────────────────────── */
-/** content.js 의 nextChunk 와 같은 점수 */
-function pickPlaying(t) {
-  let best = null, bs = Infinity;
-  for (const c of S.chunks) {
-    const s0 = c.segs[0].start, e0 = c.segs[c.segs.length - 1].end;
-    const sc = t >= s0 - 5 && t <= e0 ? -1 : s0 >= t ? s0 - t : 1e6 + (t - s0);
-    if (sc < bs) { bs = sc; best = c; }
-  }
-  return best && { chunk: best, playing: bs === -1 };
+/* ── 번역 세션 ──────────────────────────────────────────────── */
+function stopSession() {
+  const s = S.session;
+  if (!s) return;
+  s.stop = true;
+  for (const ctl of s.inflight.values()) ctl.abort();
+  S.session = null;
+  $("#run").disabled = false;
+  $("#seek").disabled = true;
+  $("#stop").disabled = true;
 }
 
-function onPlayhead() {
-  const t = +$("#playhead").value;
-  $("#playhead-out").textContent = fmt(t);
-  $("#preview").value = t;
-  drawPreview();
-}
+/**
+ * 확장의 runner 와 같은 구조로 돌린다. 판단(우선순위·슬라이스·병합)은 전부
+ * content.js 의 실제 함수가 한다. 여기 있는 것은 동시 실행 루프뿐이다.
+ * @param {boolean} isSeek 이미 도는 세션의 재생 위치만 옮기는가
+ */
+async function startSession(isSeek) {
+  if (isSeek && S.session) { markSeek(); return; }
+  stopSession();
 
-/* ── 실행 ─────────────────────────────────────────────────────── */
-function laneStart(n) {
-  const lane = $("#lane-one");
-  lane.className = "lane running";
-  $("#lane-one .n").textContent = `N=${n}`;
-  $("#meta-one").textContent = "요청 중…";
-  const t0 = performance.now();
-  const timer = setInterval(() => {
-    $("#timer-one").textContent = `${((performance.now() - t0) / 1000).toFixed(1)}s`;
-  }, 50);
-  return { t0, stop: () => clearInterval(timer) };
-}
+  seedRawLines(S.segments);
+  renderLines();
 
-function inspect(segs, res) {
-  const lines = res.lines;
-  const empty = lines.filter((l) => !String(l.trans ?? "").trim()).length;
-  // 구멍 = 입력 구간 중 반환 줄이 못 덮는 시간
-  const uni = (iv) => {
-    const a2 = iv.map((x) => [x.start, x.end]).filter(([p, r]) => r > p).sort((p, r) => p[0] - r[0]);
-    const o = [];
-    for (const [p, r] of a2) {
-      const last = o[o.length - 1];
-      if (last && p <= last[1] + 1e-9) last[1] = Math.max(last[1], r);
-      else o.push([p, r]);
-    }
-    return o;
+  const s = {
+    pending: new Set(makeJobs(S.segments, CHUNK)),
+    inflight: new Map(),
+    stop: false,
+    t0: performance.now(),
+    mark: performance.now(),      // 게이지 기준 시각 (시작 또는 마지막 시킹)
+    target: null,                 // 기다리는 작업의 시간 구간
+    hit: null,
+    done: 0, failed: 0,
   };
-  const cur = uni(lines);
-  let hole = 0;
-  for (let [x, y2] of uni(segs.map((s2) => ({ start: s2.start, end: s2.end })))) {
-    for (const [c, d] of cur) {
-      if (d <= x || c >= y2) continue;
-      if (c > x) hole += Math.min(c, y2) - x;
-      x = Math.max(x, d);
-      if (x >= y2) break;
-    }
-    if (y2 - x > 1e-9) hole += y2 - x;
-  }
-  return { empty, holes: +hole.toFixed(2), maxOrig: Math.max(...lines.map((l) => String(l.orig).length)), lines };
-}
-
-async function fire(segs, base) {
-  const lane = laneStart(segs.length);
-  const vid = $("#bust").checked ? `harness-${Date.now()}-${S.seq++}` : `harness-${S.fx.id}-${base}`;
-  try {
-    // ★ 실제 requestTranslation 을 부른다 (타임아웃·계약 검사 포함)
-    const res = await requestTranslation(vid, S.fx.lang, segs, {
-      before: S.segs.slice(Math.max(0, base - CTX_N), base).map((s2) => s2.text),
-      after: S.segs.slice(base + segs.length, base + segs.length + CTX_N).map((s2) => s2.text),
-    }, null);
-    const ms = Math.round(performance.now() - lane.t0);
-    lane.stop();
-    const ins = inspect(segs, res);
-    $("#timer-one").textContent = `${(ms / 1000).toFixed(1)}s`;
-    $("#lane-one").className = "lane done";
-    $("#meta-one").textContent =
-      `${segs.length}조각 → ${res.lines.length}줄 · 출력 ${res.usage?.completion_tokens ?? "?"}토큰` +
-      ` · reasoning ${res.usage?.completion_tokens_details?.reasoning_tokens ?? "?"}` +
-      (ins.empty ? ` · 빈 번역 ${ins.empty}` : "") + (ins.holes ? ` · 구멍 ${ins.holes}s` : "");
-    S.runs.push({ i: S.runs.length + 1, fx: S.fx.id, n: segs.length, ms,
-      out: res.usage?.completion_tokens ?? null,
-      reason: res.usage?.completion_tokens_details?.reasoning_tokens ?? null, ...ins });
-    drawRuns();
-    return { res, ins };
-  } catch (e) {
-    lane.stop();
-    $("#timer-one").textContent = "실패";
-    $("#lane-one").className = "lane failed";
-    $("#meta-one").textContent = e.message;
-    return null;
-  }
-}
-
-async function runRace() {
-  if (S.busy) return;
-  S.busy = true;
+  s.total = s.pending.size;
+  S.session = s;
   $("#run").disabled = true;
-  try {
-    const t = +$("#playhead").value;
-    const picked = pickPlaying(t);
-    if (!picked) return;
-    const { chunk } = picked;
+  $("#seek").disabled = false;
+  $("#stop").disabled = false;
+  aimAtPlayhead();
+  gauge("run", "번역 요청 중");
+  tick();
 
-    seedRawLines(S.segs);              // 원문만 있는 상태로 되돌리고 시작
-    const r = await fire(chunk.segs, chunk.i0);
-    if (r) mergeTranslated(r.res.lines, chunk.t0, chunk.t1);   // 실제 병합
-    drawLines();
-    drawPreview();
-  } finally {
-    S.busy = false;
-    $("#run").disabled = false;
-  }
-}
+  const playhead = () => +$("#play").value;
 
-/** full 격자 전체를 번역해 오버레이 미리보기를 완성한다 (동시 8, 실제 값) */
-async function runWholeGrid() {
-  if (S.busy) return;
-  S.busy = true;
-  $("#run-full-grid").disabled = true;
-  seedRawLines(S.segs);
-  const pending = [...S.chunks];
-  let done = 0;
-  const btn = $("#run-full-grid");
   const runner = async () => {
     for (;;) {
-      const c = pending.shift();
-      if (!c) return;
-      const vid = $("#bust").checked ? `harness-${Date.now()}-${S.seq++}` : `harness-${S.fx.id}-${c.i0}`;
-      try {
-        const t0 = performance.now();
-        const res = await requestTranslation(vid, S.fx.lang, c.segs, {
-          before: S.segs.slice(Math.max(0, c.i0 - CTX_N), c.i0).map((s) => s.text),
-          after: S.segs.slice(c.i0 + c.segs.length, c.i0 + c.segs.length + CTX_N).map((s) => s.text),
-        }, null, "full");
-        const ms = Math.round(performance.now() - t0);
-        const ins = inspect("full", c.segs, res);
-        mergeTranslated(res.lines, c.t0, c.t1);      // 실제 병합
-        S.runs.push({ i: S.runs.length + 1, fx: S.fx.id, mode: "full", n: c.segs.length, ms,
-          out: res.usage?.completion_tokens ?? null,
-          reason: res.usage?.completion_tokens_details?.reasoning_tokens ?? null, ...ins });
-      } catch (e) {
-        console.warn("청크 실패", c.i0, e.message);
+      if (s.stop) return;
+      const picked = pickJob(s.pending, playhead());     // ← 실제 함수
+      if (!picked) return;
+      let job = picked.job;
+      s.pending.delete(job);
+      if (picked.playing) {
+        const { head, rest } = splitJobAt(job, playhead(), SLICE);   // ← 실제 함수
+        for (const r of rest) { s.pending.add(r); s.total++; }
+        job = head;
       }
-      btn.textContent = `full 격자 ${++done}/${S.chunks.length}`;
-      drawRuns();
-      drawLines(state.lines);
-      drawPreview();
+      const ctl = new AbortController();
+      s.inflight.set(job, ctl);
+      try {
+        const vid = $("#bust").checked
+          ? `harness-${Date.now()}-${S.seq++}` : `harness-${S.fx.id}-${job.i0}`;
+        const res = await requestTranslation(vid, S.fx.lang, job.segs, {   // ← 실제 함수
+          before: S.segments.slice(Math.max(0, job.i0 - CTX_N), job.i0).map((x) => x.text),
+          after: S.segments.slice(job.i0 + job.segs.length, job.i0 + job.segs.length + CTX_N).map((x) => x.text),
+        }, ctl.signal);
+        if (s.stop) return;
+        mergeTranslated(res.lines, job.t0, job.t1);       // ← 실제 함수
+        s.done++;
+        if (s.hit === null && s.target && job.t0 <= s.target.t && s.target.t <= job.t1) {
+          s.hit = Math.round(performance.now() - s.mark);
+          gauge(s.hit <= GOAL_MS ? "ok" : "slow",
+            `${job.segs.length}조각 · ${res.lines.length}줄 · ` +
+            `출력 ${res.usage?.completion_tokens ?? "?"}토큰`);
+        }
+        renderLines(); draw(); progress();
+      } catch (e) {
+        if (s.stop) return;
+        if (ctl.signal.aborted) { s.pending.add(job); continue; }   // 시킹으로 끊김
+        s.failed++;
+        progress();
+      } finally {
+        s.inflight.delete(job);
+      }
     }
   };
-  await Promise.all(Array.from({ length: 8 }, runner));
-  btn.textContent = "full 격자 전체 번역";
-  S.busy = false;
-  btn.disabled = false;
-}
-
-/* ── 표·줄·미리보기 ───────────────────────────────────────────── */
-function drawRuns() {
-  const tb = $("#runs tbody");
-  tb.replaceChildren();
-  for (const r of S.runs.slice(-40)) {
-    const tr = el("tr");
-    const cells = [r.i, r.fx.slice(0, 11), r.n, r.ms, r.out ?? "—", r.reason ?? "—",
-                   r.empty, r.holes || 0, r.maxOrig];
-    cells.forEach((v, i) => {
-      const td = el("td", null, String(v));
-      if (i === 6) td.className = r.empty ? "bad" : "good";
-      if (i === 7 && r.holes) td.className = "bad";
-      tr.append(td);
-    });
-    tb.append(tr);
-  }
-  const box = $("#medians");
-  box.replaceChildren();
-  if (!S.runs.length) return;
-  const ms = S.runs.map((r) => r.ms);
-  const tot = S.runs.reduce((n, r) => n + r.empty, 0);
-  const hol = S.runs.reduce((n, r) => n + (r.holes || 0), 0);
-  box.append(
-    stat("중앙", `${median(ms)}ms`, "good"),
-    stat("최소", `${Math.min(...ms)}ms`),
-    stat("최대", `${Math.max(...ms)}ms`),
-    stat("요청", S.runs.length),
-    stat("빈 번역 누계", tot, tot ? "bad" : "good"),
-    stat("구멍 누계", `${hol.toFixed(2)}s`, hol ? "bad" : "good"),
-  );
-}
-
-function drawLines(lines) {
-  const box = $("#lines");
-  box.replaceChildren();
-  const src = lines || state.lines;   // 실제 state.lines
-  if (!src || !src.length) return;
-  $("#lines-hint").textContent =
-    `${src.length}줄 · 빈 번역 ${src.filter((l) => !String(l.trans ?? "").trim()).length}개 · ` +
-    `최장 ${Math.max(...src.map((l) => String(l.orig).length))}자`;
-  for (const l of src) {
-    const t = String(l.trans ?? "");
-    const n = el("div", `ln${t.trim() ? "" : " empty"}${String(l.orig).length > 85 ? " long" : ""}`);
-    n.append(
-      el("div", "time", `${(+l.start).toFixed(2)} → ${(+l.end).toFixed(2)}  (${String(l.orig).length}자)`),
-      el("div", "o", l.orig),
-      el("div", "t", t),
-    );
-    box.append(n);
+  await Promise.all(Array.from({ length: RUNNERS }, runner));
+  if (S.session === s && !s.stop) {
+    $("#prog-note").textContent = `완료 — ${s.done}/${s.total} 작업` + (s.failed ? `, 실패 ${s.failed}` : "");
+    $("#run").disabled = false;
+    $("#seek").disabled = true;
+    $("#stop").disabled = true;
+    S.session = null;
   }
 }
 
-function drawPreview() {
+/** 지금 재생 위치를 "기다리는 지점"으로 삼는다 */
+function aimAtPlayhead() {
+  const s = S.session;
+  if (!s) return;
+  s.target = { t: +$("#play").value };
+  s.hit = null;
+}
+
+/** 세션을 유지한 채 재생 위치만 옮긴다 — 확장의 seeked 처리와 같다 */
+function markSeek() {
+  const s = S.session;
+  if (!s) return;
+  s.mark = performance.now();
+  aimAtPlayhead();
+  const t = +$("#play").value;
+  let cut = 0;
+  for (const [job, ctl] of s.inflight) {
+    if (!isPlayingJob(job, t)) { ctl.abort(); cut++; }   // ← 실제 함수
+  }
+  gauge("run", `시킹 — 무관해진 요청 ${cut}개 취소`);
+}
+
+function gauge(cls, note) {
+  $("#gauge").className = `gauge ${cls}`;
+  $("#gauge-note").textContent = note;
+}
+
+function tick() {
+  const s = S.session;
+  if (!s) return;
+  const ms = s.hit ?? Math.round(performance.now() - s.mark);
+  $("#timer").textContent = (ms / 1000).toFixed(1);
+  $("#bar").style.width = `${Math.min(100, (ms / (GOAL_MS * 2)) * 100)}%`;
+  if (s.hit === null && ms > GOAL_MS) $("#gauge").className = "gauge slow";
+  requestAnimationFrame(tick);
+}
+
+function progress() {
+  const s = S.session;
+  if (!s) return;
+  $("#prog").style.width = `${(100 * s.done) / s.total}%`;
+  $("#prog-note").textContent = `${s.done}/${s.total} 작업` +
+    (s.failed ? ` · 실패 ${s.failed}` : "") + ` · 진행 중 ${s.inflight.size}`;
+}
+
+/* ── 화면 ───────────────────────────────────────────────────── */
+function draw() {
   const t = +$("#preview").value;
-  $("#preview-out").textContent = fmt(t);
-  const i = findLine(t);                    // ← 실제 findLine
-  const line = i >= 0 ? state.lines[i] : null;
+  $("#preview-out").textContent = clock(t);
+  const i = findLine(t);                        // ← 실제 함수
+  const line = i >= 0 ? state.lines[i] : null;  // ← 실제 state
   $("#ytdual-orig").textContent = line ? line.orig : "";
   $("#ytdual-trans").textContent = line ? (line.trans || "") : "";
   $("#ytdual-box").classList.toggle("empty", !line);
 
-  const covered = S.segs.some((s) => s.start <= t && t <= s.end);
-  $("#preview-stats").replaceChildren(
-    stat("줄 index", i),
-    stat("상태", line ? (line.translated ? "번역됨" : "원문") : "—"),
-    stat("이 시각 자막", covered ? (line ? "표시됨" : "비어 있음 ⚠") : "원본에도 없음",
+  const covered = S.segments.some((x) => x.start <= t && t <= x.end);
+  $("#stats-preview").replaceChildren(
+    stat("줄", i >= 0 ? `#${i}` : "없음"),
+    stat("상태", line ? (line.translated ? "번역됨" : "원문") : "—",
+      line ? (line.translated ? "good" : "warn") : ""),
+    stat("이 시각", covered ? (line ? "표시됨" : "비어 있음") : "원본에도 없음",
       covered ? (line ? "good" : "bad") : ""),
   );
+}
+
+function renderLines() {
+  const lines = state.lines || [];
+  const t = +$("#preview").value;
+  const cur = findLine(t);
+  const empty = lines.filter((l) => l.translated && !String(l.trans).trim()).length;
+  const doneN = lines.filter((l) => l.translated).length;
+  const longest = lines.length ? Math.max(...lines.map((l) => String(l.orig).length)) : 0;
+
+  $("#stats-lines").replaceChildren(
+    stat("줄", lines.length),
+    stat("번역됨", `${doneN}/${lines.length}`, doneN ? "good" : ""),
+    stat("빈 번역", empty, empty ? "bad" : "good"),
+    stat("최장", `${longest}자`, longest > 85 ? "warn" : ""),
+  );
+
+  // 재생 지점 주변만 그린다 — 3591줄을 전부 그리면 스크롤이 무의미하다
+  const from = Math.max(0, (cur < 0 ? 0 : cur) - 4);
+  const box = $("#lines");
+  box.replaceChildren();
+  for (let i = from; i < Math.min(lines.length, from + 40); i++) {
+    const l = lines[i];
+    const t2 = String(l.trans ?? "");
+    const cls = i === cur ? "now"
+      : !l.translated ? "raw"
+        : t2.trim() ? "done" : "empty";
+    const n = el("div", `ln ${cls}`);
+    n.append(
+      el("div", "t0", `${(+l.start).toFixed(1)} → ${(+l.end).toFixed(1)}`),
+      el("div", "o", l.orig),
+      el("div", "t", t2),
+    );
+    box.append(n);
+  }
 }
 
 boot();
