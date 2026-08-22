@@ -158,10 +158,14 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  * 묶은 단위가 곧 화면의 한 줄이다. 그래서 한도를 MAX_LINE_CHARS 에 맞춘다.
  * 이 한도 안에서 만들어지므로 splitLine 이 거의 걸리지 않는다 — 걸리면 원문과
  * 번역의 절 경계가 어긋나므로(W19) 안 걸리는 편이 낫다. */
-const MIN_GROUP_CHARS = 15;  // 이보다 짧은 묶음은 이웃에 붙인다 (토막 번역 방지)
+const MIN_GROUP_CHARS = 15;  // 이보다 짧은 "미완결" 조각은 이웃에 붙인다
 const GROUP_MAX_GAP = 1.2;   // 이보다 벌어지면 화면 전환·침묵으로 본다
 const GROUP_MAX_SECS = 8;    // 한 줄이 이보다 오래 머무르면 읽는 리듬이 깨진다
 const SENTENCE_END = /[.!?…。？！]["'”’)\]]?$/;
+// [MUSIC PLAYING], [음악], (笑) 같은 지문은 그 자체로 완결된 한 줄이다. 문장부호로
+// 끝나지 않아 SENTENCE_END 에 안 걸리므로 따로 본다. 안 그러면 다음 대사에 붙어
+// "[MUSIC PLAYING] [APPLAUSE] SUNDAR PICHAI: Hello, everyone." 같은 줄이 나온다.
+const CUE_ONLY = /^[[(（【][^\]）】]*[\])）】]$/;
 // 일본어·중국어는 띄어쓰기가 없다. 조각을 공백으로 이으면 없던 공백이 생겨
 // 단어가 갈라진다 ("お話を聞いてみ" + "たいと思い" → "…みたいと" 사이에 공백).
 // 한글(\uac00-\ud7af)은 띄어쓰기를 쓰므로 제외한다.
@@ -183,14 +187,21 @@ function groupSegments(segs) {
     const s = segs[i];
     if (!cur) { cur = { start: s.start, end: s.end, text: s.text, from: i, to: i }; continue; }
     const joined = joinText(cur.text, s.text);
-    // 아주 짧은 조각은 혼자 두지 않는다. "Bien," 한 줄이 "그런데 이" 같은 토막
-    // 번역을 낳는다. 옛 SYSTEM 도 같은 규칙을 문장으로 갖고 있었다
-    // ("A very short interjection joins the adjacent line").
+    // 완결된 줄은 짧아도 혼자 둔다. "Good morning." 은 토막이 아니라 문장이고,
+    // 사람이 일부러 한 줄로 끊은 것이다. 붙이면 한 줄에 문장이 둘 이상 들어간다.
+    //   [실측: 흡수 규칙에 문장 예외가 없던 동안 사람 자막에서
+    //    "[MUSIC PLAYING] [APPLAUSE AND CHEERING] SUNDAR PICHAI: Hello, everyone." 처럼
+    //    별개 이벤트 셋이 한 줄로 뭉쳤다]
+    // 지문은 앞에서도 뒤에서도 끊는다. 뒤만 보면 "…없이 [clears throat]" 처럼
+    // 앞 조각에 먼저 흡수돼 버려 CUE_ONLY 가 걸릴 기회조차 없다.
+    const complete = SENTENCE_END.test(cur.text) || CUE_ONLY.test(cur.text) || CUE_ONLY.test(s.text);
+    // 미완결인데 아주 짧은 조각만 이웃에 붙인다. "Bien," 한 줄은 "그런데 이" 같은
+    // 토막 번역을 낳는다 — 그건 문장이 아니라 잘린 조각이다.
     // [실측 13 fixture: 15자 미만 묶음이 66/1894 = 3.5%]
-    const tiny = cur.text.length < MIN_GROUP_CHARS;
+    const tiny = !complete && cur.text.length < MIN_GROUP_CHARS;
     const cap = tiny ? MAX_LINE_CHARS + 15 : MAX_LINE_CHARS;
     const breakHere =
-      (SENTENCE_END.test(cur.text) && !tiny) ||    // 앞이 문장으로 끝났다
+      complete ||                                  // 앞이 문장이나 지문으로 끝났다
       joined.length > cap ||                       // 자막 한 줄로 읽기엔 길다
       s.start - cur.end > GROUP_MAX_GAP ||         // 침묵이 있었다
       s.end - cur.start > GROUP_MAX_SECS;          // 너무 오래 붙잡는다

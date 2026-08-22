@@ -17,11 +17,16 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { loadWorker } from "./worker-harness.js";
+import { loadContent } from "./harness.js";
 import { loadRealFixtures, skipReason } from "./real-fixtures.js";
 
 const w = loadWorker();
+const y = loadContent();
 const FIXTURES = loadRealFixtures();
 const skip = skipReason(FIXTURES);
+
+/** 확장이 워커에 보내기 전에 반드시 통과시키는 정규화 */
+const norm = (fx) => y.normalizeSegments(fx.segments, fx.durationSeconds);
 
 /** content.js 의 청크 격자(12조각)와 같은 단위로 잘라 실제 요청 모양을 만든다 */
 function chunksOf(segments, size = 12) {
@@ -205,4 +210,71 @@ test("문맥이 없으면 블록 자체를 넣지 않는다", () => {
   const p = w.buildPayload([{ text: "only" }], [], []);
   assert.equal(p.includes("CONTEXT"), false);
   assert.match(p, /^TRANSLATE THESE 1 LINES:\n0: only$/);
+});
+
+/* ── 사람이 정한 줄 경계를 존중하는가 ────────────────────────────────
+ * pickTrack 을 고쳐 사람 자막이 우선되면서 드러난 문제다. 사람 자막은 이미
+ * 문장 단위로 끊겨 있어 묶을 것이 거의 없다 — 실측상 71~99% 가 1조각 묶음이다.
+ * 그런데 "짧은 조각은 이웃에 붙인다" 규칙이 완결된 짧은 문장까지 삼켰다.
+ *   [실측: "[MUSIC PLAYING]" + "[APPLAUSE AND CHEERING]" + "SUNDAR PICHAI: Hello,
+ *    everyone." 이 한 줄로,  "Good morning." + "Welcome to Google I/O. We want..."
+ *    이 한 줄로 뭉쳤다]
+ * 흡수는 "잘린 조각"에만 적용되어야 한다. 문장은 짧아도 문장이다.
+ */
+test("★ 짧아도 완결된 문장은 혼자 둔다", () => {
+  const g = w.groupSegments([
+    { start: 0, end: 1, text: "Good morning." },
+    { start: 1, end: 4, text: "Welcome to Google I/O. We want to get our best" },
+  ]);
+  assert.equal(g.length, 2, "완결된 짧은 문장이 다음 줄에 흡수됐다");
+  assert.equal(g[0].text, "Good morning.");
+});
+
+test("★ 지문([MUSIC PLAYING] 등)은 그 자체로 한 줄이다", () => {
+  const g = w.groupSegments([
+    { start: 0, end: 1, text: "[MUSIC PLAYING]" },
+    { start: 1, end: 2, text: "[APPLAUSE AND CHEERING]" },
+    { start: 2, end: 4, text: "SUNDAR PICHAI: Hello, everyone." },
+  ]);
+  // vm 컨텍스트가 달라 배열 프로토타입이 다르므로 host 배열로 옮겨 비교한다
+  assert.deepEqual([...g].map((x) => x.text),
+    ["[MUSIC PLAYING]", "[APPLAUSE AND CHEERING]", "SUNDAR PICHAI: Hello, everyone."]);
+});
+
+test("한국어·일본어 지문도 마찬가지", () => {
+  const g = w.groupSegments([
+    { start: 0, end: 1, text: "[음악]" },
+    { start: 1, end: 3, text: "여기 짧은 영화 대본이 하나 있습니다." },
+  ]);
+  assert.equal(g.length, 2);
+  assert.equal(g[0].text, "[음악]");
+});
+
+test("잘린 짧은 조각은 여전히 이웃에 붙는다 — 토막 번역 방지", () => {
+  // "Bien," 은 문장이 아니라 잘린 조각이다. 혼자 두면 "그런데 이" 같은 번역이 나온다.
+  const g = w.groupSegments([
+    { start: 0, end: 1, text: "Bien," },
+    { start: 1, end: 4, text: "esa idea proviene directamente del titulo de un articulo" },
+  ]);
+  assert.equal(g.length, 1);
+  assert.match(g[0].text, /^Bien, esa idea/);
+});
+
+test("★ 묶기가 문장 경계를 넘어 합치지 않는다 — 실 자막 전체", { skip }, () => {
+  // 확장이 실제로 보내는 것은 정규화된 자막이다. 원본을 넣으면 시간 규칙이
+  // 다르게 걸려 여기서만 보이는 결과가 나온다.
+  const bad = [];
+  for (const fx of FIXTURES) {
+    for (const batch of chunksOf(norm(fx))) {
+      for (const g of w.groupSegments(batch)) {
+        if (g.from === g.to) continue;
+        const parts = batch.slice(g.from, g.to + 1);
+        // 마지막을 뺀 어떤 조각이라도 문장·지문으로 끝났다면, 거기서 끊었어야 한다
+        const merged = parts.slice(0, -1).find((s) =>
+          /[.!?…。？！]["'”’)\]]?$/.test(s.text) || /^[[(（【][^\]）】]*[\])）】]$/.test(s.text));
+        if (merged) bad.push(`${fx.id}: "${merged.text.slice(0, 40)}" 뒤에서 안 끊었다`);
+      }
+    }
+  }
+  assert.deepEqual(bad.slice(0, 5), [], `문장 경계를 넘은 묶음 ${bad.length}개`);
 });
