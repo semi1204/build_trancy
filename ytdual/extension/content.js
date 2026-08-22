@@ -30,10 +30,30 @@ const DEFAULTS = {
  *  I1  segments 를 확보한 뒤로 화면에 자막이 비는 순간이 없다. 번역을 기다리는
  *      동안에도 원문(raw)이 떠 있다. 이 시점 이후의 showStatus 는 위반이다.
  *  I2  state.lines 는 항상 start 오름차순이다.                          [실측]
- *  I3  같은 시각을 raw 줄과 번역 줄이 동시에 덮지 않는다. findLine 은 start 가
- *      가장 늦은 줄을 고르므로, 겹치면 번역이 원문으로 되돌아가 보인다.   [실측]
- *  I4  번역 도착은 raw 를 "교체"한다. "추가"하면 I3 가 깨진다.
- *  I5  모든 구간은 번역되었거나 raw 원문으로 남는다 — 조용한 빈 구간은 없다. [실측]
+ *  I3  등급이 다른 두 줄이 같은 시각을 덮지 않는다. findLine 은 start 가 가장 늦은
+ *      줄을 고르므로, 등급이 섞여 겹치면 정확한 번역이 거친 번역이나 원문으로
+ *      되돌아가 보인다. 같은 등급끼리의 짧은 겹침은 허용한다 — I5 를 지키려면
+ *      경계에서 겹침이 불가피하고, 겹침은 구멍보다 언제나 낫다.           [실측]
+ *  I4  번역 도착은 낮은 등급을 "교체"한다. "추가"하면 I3 가 깨진다. 남의 full
+ *      결과는 절대 지우지 않는다 (청크는 뒤섞인 순서로 도착한다).          [실측]
+ *  I5  ★ 모든 시각은 어떤 줄에든 덮인다 — 조용한 빈 구간은 없다. 최종 상태뿐
+ *      아니라 "번역이 절반만 도착한 중간 상태"에서도 성립해야 한다.
+ *      ★★ 현재 코드는 이걸 위반한다. Phase 4 실측: 청크 하나만 병합된 중간
+ *      상태에서 빈 시각 4개. 옛 raw 필터에서도 동일하게 재현되므로 거리 기반
+ *      2단이 만든 것이 아니라 원래 있던 결함이다.                        [실측]
+ *
+ *      원인 — 유튜브 자막은 시간이 겹친다(다음 조각이 이전 조각이 끝나기 전에
+ *      시작). mergeTranslated 가 "start 가 [t0,t1) 안"인 줄을 지우면, t1 직전에
+ *      시작하지만 t1 이후에 끝나는 이웃 조각까지 함께 지워진다. 그런데 새로
+ *      끼워 넣는 줄은 t1 까지만 덮으므로 그 뒤가 빈다.
+ *        t1 = segs[23].end = 72.4,  segs[24] = [72.0, 75.4]
+ *        72.0 < 72.4 라 제거 → [72.4, 75.4] 가 빔
+ *
+ *      지키는 방법 (I23) — 제거 조건을 "완전히 포함"으로 좁힌다.
+ *        지금:  l.start >= t0 && l.start <  t1     ← 이웃을 함께 지운다
+ *        고침:  l.start >= t0 && l.end   <= t1     ← 자기 조각만 지운다
+ *      경계를 걸친 조각은 살아남고, 그 조각을 소유한 다음 청크가 나중에 지운다.
+ *      그 사이 짧은 겹침이 생기지만 I3 가 허용하는 종류다.
  *
  * 세션 수명
  *  I6  지난 세대(gen)의 응답은 state 를 절대 변경하지 않는다. videoId 비교만으로는
@@ -53,11 +73,30 @@ const DEFAULTS = {
  *  I13 동시 번역 요청은 8개 이하. 8에서 실패 0·저하 15%, 그 이상은 미측정. [실측]
  *
  * 범위
- *  I14 유튜브 DOM 은 읽기만 한다. 쓰는 곳은 우리 오버레이뿐이다.
+ *  I14 유튜브 DOM 은 읽기만 한다. 쓰는 곳은 우리 오버레이뿐이다. native 자막을
+ *      숨기는 것도 클래스 하나로만 하고, 유튜브의 요소를 직접 고치지 않는다.
  *  I15 번역 작업은 영상 재생을 절대 블로킹하지 않는다.
  *
- * 아래 TODO(phase6) 주석들은 Phase 0 계획서의 옛 번호를 인용한다. 대응은 이렇다:
- *   옛1→I1  옛2→I2  옛3→I3  옛4→I6  옛7→I7  옛8→I5  옛9→W3  옛10→I10
+ * 거리 기반 2단 (fast / full)
+ *  I16 등급은 재생 위치와의 거리로만 정한다. 지금 재생 중인 구간만 fast 다 —
+ *      그 구간만 속도가 정확도를 이긴다. 나머지는 몇 분 뒤에나 닿으므로 full 이다.
+ *  I17 등급은 청크에 저장하지 않는다. 재큐 시점의 재생 위치로 다시 정해야 맞다
+ *      (그 사이 시킹했을 수 있다). 저장하면 낡은 등급을 쓰게 된다.
+ *  I18 워커가 돌려준 fast 배열의 길이는 보낸 조각 수와 반드시 같다. 다르면 통째로
+ *      버린다. 하나라도 밀리면 엉뚱한 시각에 엉뚱한 번역이 붙는데, 그건 번역이
+ *      없는 것보다 나쁘고 화면만 봐서는 알아챌 수 없다.
+ *  I21 full 을 받은 줄은 fast 로 덮지 않는다. 늦게 도착한 거친 번역이 이미 보고
+ *      있던 정확한 번역을 지우면 자막이 뒤로 후퇴한다.                    [실측]
+ *  I22 ★ 줄은 배열 인덱스로 지정하지 않는다. 오직 시각으로만 찾는다.
+ *      mergeTranslated 가 배열을 재구성하는 순간 state.lines 의 인덱스와
+ *      segments 의 인덱스 대응이 영구히 깨지기 때문이다.
+ *      Phase 4 실측: 12조각짜리 full 이 한 번 병합되자 lines[20] 이 frag 20 에서
+ *      frag 32 로 밀렸고, applyFast(20,...) 이 조각 20 의 번역을 조각 32 자리에
+ *      붙였다. "인덱스는 영구히 1:1" 이라는 가정은 성립하지 않는다.        [실측]
+ *  I23 모든 raw 줄은 정확히 한 청크의 [t0, t1] 에 완전히 포함된다. 즉 제거 책임이
+ *      유일하다. 이 성질이 I5 의 구멍을 막는 근거다 — "완전히 포함"으로 지우면
+ *      각 조각은 자기 소유 청크에 의해 정확히 한 번 제거된다.
+ *
  * ──────────────────────────────────────────────────────────────────── */
 
 /**
@@ -97,6 +136,16 @@ const DEFAULTS = {
  *   유튜브 자막은 시간상 겹치므로(다음 seg 가 이전 seg 가 끝나기 전에 시작) end 로
  *   잘라내야 이웃 raw 줄까지 정리되어 I3 가 유지된다. start 로 바꾸면 겹침이 생긴다.
  *   Phase 4 에서 start 안을 실제로 구현해 측정했고 겹침 2건이 나와 폐기했다.
+ *
+ * 불변식 I23: [t0, t1] 은 이 청크가 소유한 조각들을 완전히 포함한다. 첫 조각의
+ *   start 부터 마지막 조각의 end 까지이므로 정의상 그렇다. 그리고 이웃 청크의
+ *   조각은 완전히 포함하지 않는다 — 다음 조각은 t1 이후에 끝나기 때문이다.
+ *   따라서 "완전히 포함된 줄만 제거"하면 각 조각의 제거 책임이 정확히 한 청크에만
+ *   있다. 이것이 I5(빈 구간 없음)를 성립시키는 유일한 근거다.
+ *
+ * ★ 주의: t1 은 "이 청크가 덮는 시간의 끝"이지 "다음 청크가 시작하는 시각"이 아니다.
+ *   겹치는 자막에서는 다음 청크의 t0(= 다음 조각의 start)가 이 청크의 t1 보다 이르다.
+ *   두 값을 같다고 가정하는 코드를 쓰면 그 간극이 곧 빈 시각이 된다.
  */
 
 /**
@@ -311,18 +360,25 @@ async function requestTranslation(videoId, lang, segments, ctx = {}, signal = nu
           segments,
           ctxBefore: ctx.before || [],   // 청크 경계에서도 번역이 이어지게
           ctxAfter: ctx.after || [],
+          mode,
         }),
       });
       if (!res.ok) {
         const detail = await res.text().catch(() => "");
         throw new Error(`서버 ${res.status} ${detail.slice(0, 120)}`);
       }
-      // TODO(phase6): 응답에서 usage 도 꺼내 { lines, usage } 로 반환한다. 반환 형태가
-      //   배열에서 객체로 바뀌므로 호출부 1곳(runner)도 함께 고쳐야 한다 — 안 고치면
-      //   mergeTranslated 에 객체가 들어가 자막이 통째로 사라진다.
-      const { lines } = await res.json();
+      const payload = await res.json();
+      // I18: fast 는 길이 일치가 유일한 계약이다. 밀린 채로 받아들이면 엉뚱한 시각에
+      //   엉뚱한 번역이 붙고, 화면만 봐서는 알아챌 수 없다. 통째로 버린다.
+      if (mode === "fast") {
+        if (!Array.isArray(payload.t) || payload.t.length !== segments.length) {
+          throw new Error(`fast 길이 불일치 ${payload.t?.length}/${segments.length}`);
+        }
+        return { t: payload.t, usage: payload.usage };
+      }
+      const lines = payload.lines;
       if (!Array.isArray(lines) || !lines.length) throw new Error("빈 응답");
-      return lines;
+      return { lines, usage: payload.usage };
     } catch (e) {
       if (signal?.aborted) throw e;        // 세션 종료 — 재시도하지 않는다 (I7)
       if (attempt >= 1) throw e;           // 1회 재시도 후 포기
@@ -649,10 +705,8 @@ function positionOverlay() {
  *  @param {Segment[]} segments
  *  @returns {void} */
 function seedRawLines(segments) {
-  // TODO(phase6): raw: true → tier: null 로 바꾼다. Line typedef 가 이미 tier 로 정의돼
-  //   있고, 두 필드를 병존시키면 "raw 인데 tier 가 full" 같은 모순 상태가 표현 가능해진다.
   state.lines = segments.map((s) => ({
-    start: s.start, end: s.end, orig: s.text, trans: "", raw: true,
+    start: s.start, end: s.end, orig: s.text, trans: "", tier: null,
   }));
   state.idx = -2;                 // 다음 render 가 다시 계산하게
   state.perf.tFirstPaint = performance.now() - state.perf.t0;
@@ -664,46 +718,77 @@ function seedRawLines(segments) {
  *  확실히 교체되어야 raw 와 번역본이 같은 시각에 겹치지 않는다.
  *
  *  불변식 — 이 함수가 반환된 뒤 항상 참이어야 한다:
- *    I2  state.lines 가 start 오름차순이다.
- *    I3  raw 줄의 start 가 어떤 번역 줄의 [start, end) 안에 들어가지 않는다.
- *    I4  제거 대상은 raw 줄뿐이다. 이미 번역된 줄은 건드리지 않는다 (청크가 뒤섞인
- *        순서로 도착하므로 남의 결과를 지우면 안 된다).
- *    I5  제거한 구간은 lines 가 반드시 덮는다. 덮지 못하면 빈 시각이 생긴다.
- *  Phase 4 에서 240조각·5청크·도착순서 뒤섞음·시간겹침 조건으로 실측 통과했다.
+ *    I2  state.lines 가 start 오름차순이다.                              [실측]
+ *    I3  등급이 다른 두 줄이 같은 시각을 덮지 않는다.                     [실측]
+ *    I4  제거 대상은 이 구간의 낮은 등급 줄뿐이다. 남의 full 결과는 건드리지
+ *        않는다 (청크가 뒤섞인 순서로 도착한다).                          [실측]
+ *    I5  ★ 제거한 것은 반드시 덮는다. 현재 위반 중 — 아래 참조.
+ *    I23 각 조각의 제거 책임은 정확히 한 청크에만 있다.
+ *
+ *  ★★ 현재 이 함수는 I5 를 위반한다 (Phase 4 실측: 중간 상태에서 빈 시각 4개).
+ *    제거 조건이 "start 가 [t0,t1) 안"이라, t1 직전에 시작해 t1 이후에 끝나는
+ *    이웃 조각까지 지워버린다. 새로 넣는 줄은 t1 까지만 덮으므로 그 뒤가 빈다.
+ *    고칠 곳은 한 줄이다 — 제거 조건을 "완전히 포함"으로 좁힌다:
+ *        l.start >= t0 && l.start <  t1     (지금: 이웃까지 지움)
+ *        l.start >= t0 && l.end   <= t1     (고침: 자기 조각만)
+ *    이렇게 하면 경계를 걸친 조각은 살아남아 다음 청크가 지운다. 그동안 짧은
+ *    겹침이 생기지만 같은 등급끼리이므로 I3 가 허용하는 종류이고, 겹침은
+ *    구멍보다 언제나 낫다 — 겹치면 원문이 잠깐 보이고, 비면 아무것도 안 보인다.
+ *
+ *  Phase 4 검증 조건: 240조각·시간겹침·도착순서 뒤섞음. 최종 상태뿐 아니라
+ *    청크가 하나만 도착한 중간 상태에서도 검사해야 한다 — 지난 세션이 이걸
+ *    안 봐서 이 결함을 놓쳤다.
  *
  *  @param {Line[]} lines  워커가 돌려준 번역 줄
  *  @param {number} t0     교체할 구간의 시작(초)
  *  @param {number} t1     교체할 구간의 끝(초)
  *  @returns {void} */
 function mergeTranslated(lines, t0, t1) {
-  // TODO(phase6): ★ 이 필터가 설계 D 에서 가장 위험한 한 줄이다. 조건을 l.raw 에서
-  //   "tier !== 'full'" 로 넓혀야 한다. 지금 조건 그대로면 fast 로 채워진 줄은 raw 가
-  //   아니라서 살아남고, 아래 concat 이 full 줄을 덧붙여 같은 시각을 두 줄이 덮는다
-  //   (I3 위반). 화면에는 자막이 두 개 겹쳐 보인다.
-  // TODO(phase6): 들어오는 lines 에 tier: "full" 을 찍는다. 안 찍으면 tier 가 undefined 라
-  //   다음 fast 응답이 이 줄을 덮어써 정확한 번역이 거친 번역으로 후퇴한다 (I21).
-  // raw 만 걷어낸다 — 청크는 뒤섞인 순서로 도착하므로 남의 번역 결과를 지우면 안 된다 (I4)
-  const kept = state.lines.filter((l) => !(l.raw && l.start >= t0 && l.start < t1));
-  state.lines = kept.concat(lines).sort((a, b) => a.start - b.start);   // I2
+  // 제거 조건이 "완전히 포함"인 것이 I5 의 핵심이다. start 만 보면 t1 직전에 시작해
+  // t1 이후에 끝나는 이웃 조각까지 지워지고, 새 줄은 t1 까지만 덮으므로 그 뒤가 빈다.
+  // end <= t1 로 좁히면 각 조각은 자기를 소유한 청크에만 지워진다 (I23).
+  // full 이 아닌 줄(null=원문, fast=조각번역)이 대상이다. fast 를 남기면 아래 concat 이
+  // 겹쳐 등급이 다른 두 줄이 같은 시각을 덮는다 (I3). 남의 full 은 건드리지 않는다 (I4).
+  const kept = state.lines.filter((l) => !(l.tier !== "full" && l.start >= t0 && l.end <= t1));
+  const stamped = lines.map((l) => ({ ...l, tier: "full" }));            // I21
+  state.lines = kept.concat(stamped).sort((a, b) => a.start - b.start);  // I2
   state.idx = -2;
 }
 
 /** 조각별(fast) 번역을 state.lines 에 제자리 대입한다. 배열을 재구성하지 않는다.
- *  seedRawLines 가 segments 와 1:1 로 줄을 깔았으므로 lines[i0 + j] 가 곧 segs[j] 다.
  *
  *  불변식 — 이 함수가 반환된 뒤 항상 참이어야 한다:
  *    I2  자명하게 유지된다. 줄을 넣거나 빼거나 재정렬하지 않는다.
  *    I3  자명하게 유지된다. start/end 를 건드리지 않으므로 겹침이 생길 수 없다.
+ *    I5  빈 번역은 등급을 올리지 않는다. 원문이 그대로 남아 화면이 비지 않는다.
  *    I21 이미 full 을 받은 줄은 덮지 않는다. 늦게 도착한 거친 번역이 정확한
- *        번역을 지우면 사용자가 보던 자막이 뒤로 후퇴한다.
- *    I18 trans.length 는 반드시 segs.length 와 같다. 다르면 인덱스가 밀려
- *        엉뚱한 시각에 엉뚱한 번역이 붙으므로, 호출 전에 검사해 통째로 버린다.
+ *        번역을 지우면 사용자가 보던 자막이 뒤로 후퇴한다.               [실측]
+ *    I22 줄을 배열 인덱스로 찾지 않는다. 오직 시각으로만 찾는다.
  *
- *  @param {number}   i0     이 청크가 segments 에서 시작한 인덱스
- *  @param {string[]} trans  조각과 같은 순서·같은 길이의 번역문
+ *  I22 를 이렇게 지킨다 — mergeTranslated 가 배열을 재구성하는 순간 state.lines 의
+ *    인덱스와 segments 의 인덱스 대응은 영구히 깨진다 (Phase 4 실측: full 한 번에
+ *    lines[20] 이 frag 20 → frag 32 로 밀렸고, 조각 20 의 번역이 조각 32 에 붙었다).
+ *    그래서 인덱스를 받지 않고 조각 자체를 받아 start 로 줄을 찾는다. 두 배열 모두
+ *    start 오름차순이므로 한 번의 병행 순회로 끝난다(이진 탐색 불필요).
+ *    start 비교에 오차 허용치를 두지 않는 것은 seedRawLines 가 같은 Segment 객체의
+ *    s.start 를 그대로 복사했기 때문이다 — 동일한 double 이라 정확히 일치한다.
+ *
+ *  @param {Segment[]} segs   이 요청으로 보낸 조각들 (segments 의 연속 구간)
+ *  @param {string[]}  trans  segs 와 같은 순서·같은 길이의 번역문
  *  @returns {void} */
-function applyFast(i0, trans) {
-  throw new Error("not implemented");
+function applyFast(segs, trans) {
+  let i = 0;
+  for (let j = 0; j < segs.length; j++) {
+    const s = segs[j];
+    while (i < state.lines.length && state.lines[i].start < s.start) i++;
+    const line = state.lines[i];
+    if (!line || line.start !== s.start) continue;   // 이미 full 이 덮어 사라진 줄
+    if (line.tier === "full") continue;              // I21
+    if (!trans[j]) continue;                         // I5: 빈 번역은 원문 유지
+    line.trans = trans[j];
+    line.tier = "fast";
+  }
+  state.idx = -2;
 }
 
 function findLine(t) {
@@ -782,9 +867,10 @@ async function start() {
   const myGen = ++state.gen;                  // I6
   state.abort = new AbortController();
   const sig = state.abort.signal;             // I8: 지역 캡처 (stop() 이 state.abort 를 비운다)
-  // TODO(phase6): segsPerChunk 와 tokens 를 여기에도 넣는다. Phase 1 에서 최상위 리터럴에만
-  //   추가해 이 재초기화와 형태가 어긋나 있다 — 지금 실행하면 두 필드는 undefined 다.
-  state.perf = { t0: performance.now(), tPlayer: 0, tSegs: 0, tFirstPaint: 0, tFirstTrans: 0, chunkMs: [] };
+  state.perf = {
+    t0: performance.now(), tPlayer: 0, tSegs: 0, tFirstPaint: 0, tFirstTrans: 0,
+    chunkMs: [], segsPerChunk: 0, tokens: [], tierCounts: { fast: 0, full: 0 },
+  };
   syncBar();
 
   try {
@@ -815,25 +901,19 @@ async function start() {
 
     state.perf.tSegs = performance.now() - state.perf.t0;
     seedRawLines(segments);        // I1: 이 시점부터 화면은 비지 않는다
-    // TODO(phase6): 여기서 document.documentElement 에 클래스를 붙여 유튜브 native 자막을
-    //   숨긴다 (한 줄, 래퍼 함수 없음). stop() 에서 떼어낸다. 반드시 seedRawLines 뒤여야
-    //   한다 — 앞에서 끄면 원문 확보를 기다리는 동안 사용자는 아무 자막도 못 본다.
-    //   ★ 실제로 숨기는 CSS 규칙은 overlay.css 에 있어야 하는데 그 파일은 승인된 계획서
-    //   밖이다. 승인 없이는 이 TODO 를 구현할 수 없다.
+    // 우리 원문이 뜬 뒤에야 유튜브 native 자막을 숨긴다 (I14: 클래스 하나만 붙이고
+    // 유튜브 요소는 직접 고치지 않는다). 앞에서 끄면 원문 확보를 기다리는 동안
+    // 화면에 자막이 하나도 없게 된다.
+    document.documentElement.classList.add("ytdual-on");
 
     // 긴 자막을 한 요청으로 보내면 응답까지 몇 분씩 걸려 연결이 끊긴다.
     // 작은 청크로 나눠, "지금 보고 있는 지점" 주변부터 우선 번역해 바로 띄우고
     // 나머지는 백그라운드로 채운다. 이웃 세그먼트는 문맥(CTX)으로 함께 보낸다.
-    // TODO(phase6): Phase 4 스윕(8/12/24/48)의 결과값으로 확정하고, 그 값을
-    //   state.perf.segsPerChunk 에 기록한다. 크기를 안 남기면 로그의 지연 수치가
-    //   어느 크기에서 나온 것인지 알 수 없어 실행끼리 비교가 안 된다.
-    //   ★ 측정 1 에서 reasoning 이 "요청당 고정"으로 나오면 작게 쪼개도 이득이
-    //   거의 없다 — 그때는 이 값을 바꾸지 말고 Phase 0 으로 되돌아간다.
-    const TRANSLATE_CHUNK = 48;
-    // TODO(phase6): 크기가 둘로 갈린다. full 격자는 12 (terra 기준 9.7초), fast 미리보기는
-    //   8 (2.7초). 둘이 정렬될 필요는 없다 — fast 는 제자리 대입이고 full 은 시간 구간
-    //   교체라 서로 다른 격자여도 안전하다. 다만 mergeTranslated 의 필터가 fast 를
-    //   걷어내도록 고쳐진 뒤에만 그렇다.
+    // 두 격자는 정렬될 필요가 없다 — fast 는 시각으로 제자리 대입하고(I22) full 은
+    // 시간 구간을 교체하므로, 서로 다른 크기여도 안전하다.
+    const TRANSLATE_CHUNK = 12;   // full 격자.       [실측: terra 9.7초]
+    const FAST_CHUNK = 8;         // 재생 중 미리보기. [실측: terra 2.7초, reasoning 0]
+    state.perf.segsPerChunk = TRANSLATE_CHUNK;
     const CTX_N = 8;
     const chunks = [];
     for (let i = 0; i < segments.length; i += TRANSLATE_CHUNK) {
@@ -853,44 +933,51 @@ async function start() {
           : 1e6 + (t - s0);                           // 지나간 쪽은 맨 뒤
         if (sc < bestScore) { bestScore = sc; best = c; }
       }
-      return best;
+      // I16: 등급은 이 sc 를 그대로 쓴다. -1 은 "지금 재생 중"이라는 뜻이고 그 구간만
+      //   속도가 정확도를 이긴다. I17: 등급을 청크에 저장하지 않는다 — 재큐 시점의
+      //   재생 위치로 다시 정해야 맞다 (그 사이 시킹했을 수 있다).
+      return best && { c: best, playing: bestScore === -1 };
     };
-    // TODO(phase6): 등급 판정을 여기 붙인다. 위 sc 가 이미 거리다 — sc === -1 이면 지금
-    //   재생 중인 구간이므로 fast, 아니면 full. 새 거리 계산을 만들지 말고 이 값을 쓴다.
-    //   등급은 청크에 저장하지 않는다. 재큐될 때는 그때의 재생 위치로 다시 정해야
-    //   맞기 때문이다 (시킹했을 수 있다).
 
     // showStatus 없음 — 원문이 이미 떠 있는데 덮어쓰면 I1 위반
     let done = 0, failed = 0;
-    const retried = new Set();     // 청크당 재큐 1회 한정 (I5)
+    const retried = new Set();     // 청크당 실패 재큐 1회 한정 (I5)
+    const previewed = new Set();   // fast 미리보기를 이미 받은 청크. 승급과 실패 재큐를
+                                   // 구분하는 표식이자, 같은 청크의 fast 무한 반복 방지
     const runner = async () => {
       for (;;) {
         if (state.gen !== myGen || !state.active) return;   // I6
-        const c = nextChunk();
-        if (!c) return;
+        const picked = nextChunk();
+        if (!picked) return;
+        const { c, playing } = picked;
+        // 재생 중이고 아직 미리보기를 안 받은 청크만 fast (I16). previewed 가 없으면
+        // 같은 청크가 계속 재생 중인 동안 fast 만 무한히 반복한다.
+        const mode = playing && !previewed.has(c) ? "fast" : "full";
+        const segs = mode === "fast" ? c.segs.slice(0, FAST_CHUNK) : c.segs;
         pending.delete(c);
         const tReq = performance.now();
         try {
-          // TODO(phase6): { lines, usage } 로 구조분해하고, chunkMs.push 바로 옆에서
-          //   tokens 에도 같은 인덱스로 넣는다. 두 배열의 인덱스가 어긋나면 "이 지연이
-          //   이 토큰 수에서 나왔다"는 대응이 깨져 측정 전체가 무의미해진다.
-          //   usage 가 없는 청크(캐시 히트 등)는 0 이 아니라 null 을 넣는다 — Phase 1
-          //   typedef 의 "없으면 0" 서술도 함께 고친다.
-          const lines = await requestTranslation(videoId, track.languageCode, c.segs, {
+          const res = await requestTranslation(videoId, track.languageCode, segs, {
             before: segments.slice(Math.max(0, c.i0 - CTX_N), c.i0).map((s) => s.text),
-            after: segments.slice(c.i0 + c.segs.length, c.i0 + c.segs.length + CTX_N).map((s) => s.text),
-          }, sig);
+            after: segments.slice(c.i0 + segs.length, c.i0 + segs.length + CTX_N).map((s) => s.text),
+          }, sig, mode);
           if (state.gen !== myGen || !state.active) return;   // I6
+          // 두 배열은 같은 인덱스로 정렬된다 — 어긋나면 "이 지연이 이 토큰에서
+          // 나왔다"는 대응이 깨진다. usage 없는 청크는 0 이 아니라 null (해당 없음).
           state.perf.chunkMs.push(Math.round(performance.now() - tReq));
-          // TODO(phase6): 등급으로 갈린다. fast 면 applyFast(c.i0, res.t), full 이면
-          //   mergeTranslated(res.lines, c.t0, c.t1). 그리고 state.perf.tierCounts 의
-          //   해당 항목을 올린다 — 같은 구간을 두 번 번역하는 비용이 여기서만 보인다.
-          // TODO(phase6): fast 로 받은 구간은 pending 에 되돌려 full 로 한 번 더 받는다.
-          //   안 되돌리면 그 구간은 거친 번역인 채로 영영 남는다. 되돌릴 때 재시도 횟수
-          //   제한(retried)에 걸리지 않도록 승급은 실패 재큐와 구분해야 한다.
-          mergeTranslated(lines, c.t0, c.t1);                 // I2·I3·I4
+          state.perf.tokens.push(res.usage?.completion_tokens ?? null);
+          if (mode === "fast") {
+            applyFast(segs, res.t);                          // I2·I3·I5·I21·I22
+            state.perf.tierCounts.fast++;
+            previewed.add(c);
+            pending.add(c);   // full 로 승급. 안 되돌리면 거친 번역인 채로 영영 남는다
+          } else {
+            mergeTranslated(res.lines, c.t0, c.t1);          // I2·I3·I4·I5·I23
+            state.perf.tierCounts.full++;
+            done++;
+          }
           if (!state.perf.tFirstTrans) state.perf.tFirstTrans = performance.now() - state.perf.t0;
-          log(`번역 ${++done}/${chunks.length} 청크 (${state.lines.length}줄)`);
+          log(`번역 ${done}/${chunks.length} 청크 (${mode}, ${state.lines.length}줄)`);
         } catch (e) {
           if (sig.aborted || state.gen !== myGen) return;     // 세션 종료는 실패가 아니다
           if (!retried.has(c)) { retried.add(c); pending.add(c); continue; }
@@ -900,9 +987,8 @@ async function start() {
       }
     };
     // Phase 4 실측: 업스트림은 동시 8까지 거의 선형 (1개 73s / 4개 69s / 8개 84s, 실패 0). I13
-    // TODO(phase6): 청크 크기를 줄이면 청크 개수가 그만큼 늘어 8 이 처음으로 실제
-    //   병목이 된다(12분 영상 3개 → 12개, 1시간 15개 → 59개). 8-way 는 실측됐지만
-    //   총 요청 수가 4배로 늘 때의 429 는 미측정이다. Phase 4 측정 결과를 보고 정한다.
+    // 청크가 12조각 격자로 잘게 나뉘어 개수가 늘었지만(12분 영상 3 → 12개) 8 을 그대로
+    // 둔다. 8 이상은 미측정이고, I13 이 허용하는 상한이 8 이다.
     const RUNNERS = 8;
     await Promise.all(Array.from({ length: RUNNERS }, runner));
     if (state.gen !== myGen || !state.active) return;   // I6
@@ -913,11 +999,10 @@ async function start() {
       tPlayer: Math.round(p.tPlayer), tSegs: Math.round(p.tSegs),
       tFirstPaint: Math.round(p.tFirstPaint), tFirstTrans: Math.round(p.tFirstTrans),
       chunkMedian: p.chunkMs.slice().sort((a, b) => a - b)[p.chunkMs.length >> 1],
-      // TODO(phase6): tierCounts 도 함께 찍는다. fast+full 이 청크 수보다 얼마나 큰지가
-      //   중복 번역 비용이고, 그게 크면 2단 설계가 손해라는 신호다.
-      // TODO(phase6): segsPerChunk 와 토큰 통계(중앙값, reasoning 비중)를 함께 찍는다.
-      //   이 로그가 Phase 4 스윕의 유일한 관측창이라 크기와 토큰이 없으면 비교가 안 된다.
       tAllDone: Math.round(performance.now() - p.t0), chunks: chunks.length, failed,
+      // fast+full 이 chunks 보다 얼마나 큰지가 중복 번역 비용이다. 크면 2단이 손해다.
+      segsPerChunk: p.segsPerChunk, tierCounts: p.tierCounts,
+      tokMedian: p.tokens.filter((t) => t != null).sort((a, b) => a - b)[p.tokens.length >> 1] ?? null,
     });
   } catch (e) {
     console.error("[YT Dual]", e);
@@ -930,8 +1015,8 @@ async function start() {
 function stop({ keepBox = false } = {}) {
   stopAsr();
   if (state.rafId) cancelAnimationFrame(state.rafId);
-  // TODO(phase6): seedRawLines 에서 붙인 native 자막 숨김 클래스를 여기서 떼어낸다.
-  //   안 떼면 확장을 꺼도 유튜브 자막이 계속 숨겨진 채로 남는다.
+  // 안 떼면 확장을 꺼도 유튜브 자막이 계속 숨겨진 채로 남는다
+  document.documentElement.classList.remove("ytdual-on");
   state.abort?.abort();   // I7: 진행 중인 요청을 실제로 끊는다
   state.gen++;            // I6: 이 세대의 남은 응답을 무효화
   Object.assign(state, { rafId: null, lines: [], idx: -1, loop: false, active: false, abort: null });
