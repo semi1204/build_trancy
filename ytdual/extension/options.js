@@ -1,5 +1,5 @@
 const DEFAULTS = {
-  endpoint: "https://sub.example.workers.dev",
+  endpoint: "http://127.0.0.1:8787",
   target: "Korean",
   prefer: "en",
   fontSize: 22,

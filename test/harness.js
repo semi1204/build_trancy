@@ -41,6 +41,7 @@ const EPILOGUE = `
   splitJobAt,
   isPlayingJob,
   chooseSource,
+  panelTrack,
   pickTrack,
   parseTimestamp,
 };

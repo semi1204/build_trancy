@@ -253,18 +253,21 @@ document.addEventListener("dblclick", async (e) => {
   }
 
   closePop();
+  // innerHTML 을 쓰지 않는 이유 — 사이트가 CSP 에 `require-trusted-types-for 'script'`
+  // 를 걸어 두면(유튜브가 그렇다) 문자열 할당이 TypeError 로 죽는다.
+  const el = (tag, cls, text) => {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text != null) n.textContent = text;
+    return n;
+  };
+  const save = el("button", "s", "문장과 함께 저장");
+  save.addEventListener("click", () => { savePageCard(word, sentence); closePop(); });
+  const actions = el("div", "a");
+  actions.append(save);
   pop = document.createElement("div");
   pop.id = "ytdual-page-pop";
-  pop.innerHTML = `
-    <div class="w"></div>
-    <div class="m">⏳ 뜻 찾는 중…</div>
-    <div class="b"></div>
-    <div class="a"><button class="s">문장과 함께 저장</button></div>`;
-  pop.querySelector(".w").textContent = word;
-  pop.querySelector(".s").addEventListener("click", () => {
-    savePageCard(word, sentence);
-    closePop();
-  });
+  pop.append(el("div", "w", word), el("div", "m", "⏳ 뜻 찾는 중…"), el("div", "b"), actions);
   document.body.appendChild(pop);
   pop.style.left = Math.max(8, Math.min(e.clientX, innerWidth - pop.offsetWidth - 8)) + "px";
   pop.style.top = e.clientY + 14 + "px";

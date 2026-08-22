@@ -10,7 +10,7 @@
  */
 
 const DEFAULTS = {
-  endpoint: "https://sub.example.workers.dev",
+  endpoint: "http://127.0.0.1:8787",
   target: "Korean",
   prefer: "en",
   fontSize: 22,
@@ -185,6 +185,21 @@ let state = {
 
 const $ = (s, r = document) => r.querySelector(s);
 const log = (...a) => console.log("[YT Dual]", ...a);
+
+/** 요소 하나를 만든다. innerHTML 을 쓰지 않는 이유 —
+ *  유튜브는 CSP 에 `require-trusted-types-for 'script'` 를 건다. 그 상태에서
+ *  innerHTML 에 문자열을 넣으면 TypeError 가 나고, 오버레이도 버튼도 만들어지지
+ *  않아 확장이 통째로 죽은 것처럼 보인다. DOM 을 직접 세우면 그 규칙과 무관하다. */
+function make(tag, props = {}, kids = []) {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(props)) {
+    if (k === "text") n.textContent = v;
+    else if (k === "on") for (const [ev, fn] of Object.entries(v)) n.addEventListener(ev, fn);
+    else n.setAttribute(k, v);
+  }
+  for (const c of kids) n.append(c);
+  return n;
+}
 
 async function loadConfig() {
   const stored = await browser.storage.local.get(Object.keys(DEFAULTS));
@@ -369,10 +384,30 @@ function pickTrack(player) {
   return cands.slice().sort((a, b) => score(b) - score(a))[0];
 }
 
+/** 스크립트 패널이 보여줄 트랙. 유튜브는 기본 자막 트랙 하나만 띄운다.
+ *
+ *  왜 이 함수가 필요한가 — 패널에는 트랙 전환 UI 도, 어느 트랙인지 알려주는
+ *    라벨도 없다(2026-08 실측: target-id=PAmodern_transcript_view, 헤더는
+ *    "Transcript" 와 닫기 버튼뿐). 그래서 긁어온 내용이 우리가 고른 트랙인지
+ *    DOM 만 봐서는 알 수 없다.
+ *
+ *    실제로 그래서 사고가 났다. VBMUMuZBxw0 은 음성 ASR 과 "Twitch Chat" 트랙을
+ *    함께 갖는데, 유튜브의 기본값이 채팅이다(defaultCaptionTrackIndex=1).
+ *    ASR 의 timedtext 가 막히자 패널로 폴백했고, 채팅 로그가 자막으로 떴다.
+ *
+ *  @returns {object|null} 패널이 띄울 트랙. 알 수 없으면 null */
+function panelTrack(player) {
+  const r = player?.captions?.playerCaptionsTracklistRenderer;
+  const tracks = r?.captionTracks || [];
+  if (!tracks.length) return null;
+  const i = r?.audioTracks?.[0]?.defaultCaptionTrackIndex;
+  return Number.isInteger(i) ? (tracks[i] ?? null) : tracks[0];
+}
+
 /**
  * @typedef {object} FetchResult  자막 수집 한 경로의 결과
  * @property {Segment[]} segments  실패하면 빈 배열
- * @property {"ok"|"no-track"|"empty-body"|"http-error"|"parse-error"|"no-panel"} reason
+ * @property {"ok"|"no-track"|"empty-body"|"http-error"|"parse-error"|"no-panel"|"panel-other-track"} reason
  *
  * 왜 빈 배열만으로는 안 되나 — "자막이 없다"와 "수집이 실패했다"가 같은 값이 되면
  *   호출부가 둘을 구분할 수 없고, 그래서 수집 실패에도 Whisper 전사가 돌았다.
@@ -402,15 +437,25 @@ async function fetchSegments(track) {
   }
 }
 
-/** timedtext 가 막혔을 때: 유튜브 자체 스크립트 패널을 열어 DOM 에서 긁는다.
- *  (get_transcript API 는 2026 현재 protobuf 전용 get_panel 로 바뀌어 재현 불가.
- *   패널은 잠깐 열렸다 닫힌다. 데스크톱 전용 — 모바일은 전사 모드로 넘어간다.) */
+/** "1:23:45" / "4:56" → 초. 패널은 시각을 이 형태로만 준다. */
 function parseTimestamp(t) {
   const p = t.trim().split(":").map(Number);
   if (p.some(isNaN)) return null;
   return p.length === 3 ? p[0] * 3600 + p[1] * 60 + p[2] : p[0] * 60 + (p[1] || 0);
 }
 
+/** timedtext 가 막혔을 때: 유튜브 자체 스크립트 패널을 열어 DOM 에서 긁는다.
+ *  패널은 잠깐 열렸다 닫힌다. 데스크톱 전용 — 모바일은 전사 모드로 넘어간다.
+ *
+ *  ★ 이 함수는 "어느 트랙인지" 고를 수 없다. 유튜브의 기본 트랙 하나만 나온다.
+ *    호출 전에 panelTrack() 으로 그것이 우리가 고른 트랙인지 확인해야 한다.
+ *    [2026-08 실측 (CDP 로 실제 패널을 열어 확인):
+ *      · 패널 target-id = PAmodern_transcript_view
+ *      · 헤더는 "Transcript" 와 닫기 버튼뿐. 트랙 전환 UI 없음
+ *      · footer 는 빈 div. 어느 트랙인지 알려주는 라벨이 DOM 어디에도 없다
+ *      · 패널 데이터는 POST /youtubei/v1/get_panel 로 오는데 본문이 바이너리
+ *        protobuf 라 우리가 직접 만들 수 없다]
+ */
 async function scrapeTranscriptPanel() {
   const wasOpen = !!$("transcript-segment-view-model, ytd-transcript-segment-renderer");
   if (!wasOpen) {
@@ -477,6 +522,13 @@ function chooseSource(player, cap, panel) {
   if (panel.reason === "ok") return { kind: "captions", segments: panel.segments, reason: "panel" };
   if (!tracks.length) return { kind: "asr", reason: "no-track" };
 
+  if (panel.reason === "panel-other-track") {
+    return {
+      kind: "fail",
+      reason: "유튜브가 이 영상의 자막 직접 내려받기를 막고 있고, " +
+        "스크립트 패널은 다른 트랙을 보여줍니다 (이 영상은 채팅 로그가 기본 자막입니다)",
+    };
+  }
   return {
     kind: "fail",
     reason: `자막 트랙은 있는데 수집에 실패했습니다 (timedtext: ${cap.reason}, 패널: ${panel.reason})`,
@@ -495,6 +547,51 @@ function chooseSource(player, cap, panel) {
  *       3.5초 = 최대 498초. 그보다 커야 워커의 재시도가 끝나기 전에 끊지 않는다.
  *  I8   signal 은 호출자가 지역 캡처한 것을 받는다. state.abort 를 직접 읽지 않는다. */
 const REQUEST_TIMEOUT_MS = 510000;   // I12: 워커 최대 소요(498초)보다 크게
+
+/** 확장 안에서 도는가. 하네스(devtools)는 확장이 아니므로 여기가 false 다. */
+const inExtension = () => !!globalThis.browser?.runtime?.id;
+
+/**
+ * 워커 API 를 호출한다. 확장 안에서는 background 를 거친다.
+ *
+ * 왜 직접 fetch 하면 안 되나 — content script 는 유튜브 페이지의 출처를 쓴다.
+ *   브라우저는 그것을 "youtube.com 이 사설망(127.0.0.1)에 접근한다"로 보고 막는다.
+ *   Zen/Firefox 는 Local Network Access 권한을 묻고, 거절하면 CORS 오류로 끝난다.
+ *     Cross-Origin Request Blocked: http://127.0.0.1:8787/api/subtitle
+ *   background 는 페이지 출처가 아니라 확장 출처로 요청하므로 그 판정을 받지 않는다.
+ *   페이지 CSP(connect-src)를 피하려고 page.js 가 이미 쓰던 길이다.
+ *
+ * @param {AbortSignal|null} signal  끊기면 즉시 거절한다. background 의 요청 자체는
+ *   계속 돌지만 결과를 버린다 — 중요한 것은 runner 슬롯을 즉시 놓아주는 것이다.
+ *   (그 요청이 끝나면 워커가 KV 에 캐시하므로 나중에 재요청하면 0초에 온다)
+ */
+async function apiPost(path, body, signal = null) {
+  if (!inExtension()) {
+    const res = await fetch(`${cfg.endpoint}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal,
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const detail = await res.text().catch(() => "");
+      throw new Error(`서버 ${res.status} ${detail.slice(0, 120)}`);
+    }
+    return res.json();
+  }
+
+  const sent = browser.runtime.sendMessage({ type: "ytdual-fetch", path, body });
+  const r = await (signal
+    ? Promise.race([sent, new Promise((_, rej) => {
+        if (signal.aborted) return rej(new DOMException("Aborted", "AbortError"));
+        signal.addEventListener("abort",
+          () => rej(new DOMException("Aborted", "AbortError")), { once: true });
+      })])
+    : sent);
+  if (!r) throw new Error("background 무응답");
+  if (!r.ok) throw new Error(r.error ? `요청 실패 ${r.error}` : `서버 ${r.status}`);
+  return r.data;
+}
 
 /**
  * @returns {Promise<{lines: Line[], usage?: Usage}>}
@@ -517,25 +614,15 @@ async function requestTranslation(videoId, lang, segments, ctx = {}, signal = nu
   };
 
   try {
-    const res = await fetch(`${cfg.endpoint}/api/subtitle`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      signal: ctl.signal,
-      body: JSON.stringify({
-        videoId,
-        lang,
-        target: cfg.target,
-        segments,
-        ctxBefore: ctx.before || [],   // 청크 경계에서도 번역이 이어지게
-        ctxAfter: ctx.after || [],
-      }),
-    });
-    if (!res.ok) {
-      const detail = await res.text().catch(() => "");
-      throw new Error(`서버 ${res.status} ${detail.slice(0, 120)}`);
-    }
-    const payload = await res.json();
-    const lines = payload.lines;
+    const payload = await apiPost("/api/subtitle", {
+      videoId,
+      lang,
+      target: cfg.target,
+      segments,
+      ctxBefore: ctx.before || [],   // 청크 경계에서도 번역이 이어지게
+      ctxAfter: ctx.after || [],
+    }, ctl.signal);
+    const lines = payload?.lines;
     if (!Array.isArray(lines) || !lines.length) throw new Error("빈 응답");
     return { lines, usage: payload.usage };
   } finally {
@@ -563,6 +650,9 @@ function tapAudio(video) {
   return t;
 }
 
+/* 이것만 직접 fetch 한다. 오디오 Blob 은 runtime.sendMessage 로 보낼 수 없다
+ * (Chrome 은 구조화 복제가 아니라 JSON 직렬화를 쓴다). 자막 트랙이 아예 없는
+ * 영상에서만 도는 경로이고, 그때 사설망 권한을 한 번 물을 수 있다. */
 async function transcribeChunk(blob, chunkStart, rate) {
   const form = new FormData();
   form.append("file", blob, "chunk.webm");
@@ -675,12 +765,7 @@ async function flushQueue() {
   const batch = state.queue.splice(0, state.queue.length);
 
   try {
-    const res = await fetch(`${cfg.endpoint}/api/cards`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ uid: cfg.uid, cards: batch }),
-    });
-    if (!res.ok) throw new Error(String(res.status));
+    await apiPost("/api/cards", { uid: cfg.uid, cards: batch });
   } catch (e) {
     state.queue.unshift(...batch);   // 실패하면 되돌려서 다음에 재시도
     log("카드 전송 실패, 큐에 보관", e.message);
@@ -731,24 +816,18 @@ async function openWordPop(wEl) {
   const video = $("video");
   if (video && !video.paused) { video.pause(); popResume = true; }   // 읽는 동안 정지
 
-  popEl = document.createElement("div");
-  popEl.id = "ytdual-pop";
-  popEl.innerHTML = `
-    <div id="ytdual-pop-word"></div>
-    <div id="ytdual-pop-meaning">⏳ 뜻 찾는 중…</div>
-    <div id="ytdual-pop-base"></div>
-    <div id="ytdual-pop-actions">
-      <button id="ytdual-pop-save">문장과 함께 저장</button>
-      <button id="ytdual-pop-close">닫기</button>
-    </div>`;
-  popEl.querySelector("#ytdual-pop-word").textContent = word;
-  popEl.addEventListener("click", (e) => e.stopPropagation());
-  popEl.querySelector("#ytdual-pop-save").addEventListener("click", () => {
-    saveCard(word);
-    wEl.classList.add("saved");
-    closeWordPop();
-  });
-  popEl.querySelector("#ytdual-pop-close").addEventListener("click", closeWordPop);
+  popEl = make("div", { id: "ytdual-pop", on: { click: (e) => e.stopPropagation() } }, [
+    make("div", { id: "ytdual-pop-word", text: word }),
+    make("div", { id: "ytdual-pop-meaning", text: "⏳ 뜻 찾는 중…" }),
+    make("div", { id: "ytdual-pop-base" }),
+    make("div", { id: "ytdual-pop-actions" }, [
+      make("button", {
+        id: "ytdual-pop-save", text: "문장과 함께 저장",
+        on: { click: () => { saveCard(word); wEl.classList.add("saved"); closeWordPop(); } },
+      }),
+      make("button", { id: "ytdual-pop-close", text: "닫기", on: { click: closeWordPop } }),
+    ]),
+  ]);
   document.body.appendChild(popEl);
 
   const place = () => {
@@ -760,13 +839,7 @@ async function openWordPop(wEl) {
   place();
 
   try {
-    const res = await fetch(`${cfg.endpoint}/api/word`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ word, sentence, target: cfg.target }),
-    });
-    if (!res.ok) throw new Error(String(res.status));
-    const d = await res.json();
+    const d = await apiPost("/api/word", { word, sentence, target: cfg.target });
     if (!popEl) return;                    // 그 사이에 닫힘
     popEl.querySelector("#ytdual-pop-meaning").textContent = d.meaning || "—";
     popEl.querySelector("#ytdual-pop-base").textContent = d.base || "";
@@ -811,9 +884,10 @@ function applyColors() {
 function ensureOverlay() {
   let box = $("#ytdual-box");
   if (box) return box;
-  box = document.createElement("div");
-  box.id = "ytdual-box";
-  box.innerHTML = `<div id="ytdual-orig"></div><div id="ytdual-trans"></div>`;
+  box = make("div", { id: "ytdual-box" }, [
+    make("div", { id: "ytdual-orig" }),
+    make("div", { id: "ytdual-trans" }),
+  ]);
 
   // 단어 탭 → 문맥상 뜻 팝업 (저장은 팝업 안의 버튼으로)
   box.addEventListener("click", (e) => {
@@ -1105,9 +1179,16 @@ async function start() {
       cap = await fetchSegments(track)
         .catch((e) => (log("timedtext 실패", e.message), { segments: [], reason: "http-error" }));
       if (cap.reason !== "ok") {
-        log(`timedtext 실패(${cap.reason}) → 스크립트 패널에서 수집`);
-        panel = await scrapeTranscriptPanel()
-          .catch((e) => (log("패널 수집 실패", e.message), { segments: [], reason: "no-panel" }));
+        // 패널은 유튜브의 기본 트랙만 보여준다. 우리가 고른 것과 다르면 긁어봐야
+        // 다른 자막이 온다 — 채팅 로그를 자막으로 띄우느니 실패가 낫다.
+        if (panelTrack(player) !== track) {
+          log(`timedtext 실패(${cap.reason}) → 패널은 다른 트랙이라 건너뜀`);
+          panel = { segments: [], reason: "panel-other-track" };
+        } else {
+          log(`timedtext 실패(${cap.reason}) → 스크립트 패널에서 수집`);
+          panel = await scrapeTranscriptPanel()
+            .catch((e) => (log("패널 수집 실패", e.message), { segments: [], reason: "no-panel" }));
+        }
       }
     }
 
@@ -1303,15 +1384,16 @@ document.addEventListener("keydown", (e) => {
 
 function addButton() {
   if ($("#ytdual-bar")) return;
-  const bar = document.createElement("div");
-  bar.id = "ytdual-bar";
-  bar.innerHTML = `
-    <button id="ytdual-btn-toggle" title="이중 자막 켜기/끄기 (Alt+Y)">자막</button>
-    <button id="ytdual-btn-opts" title="설정">⚙</button>`;
-  bar.querySelector("#ytdual-btn-toggle").addEventListener("click", toggle);
-  bar.querySelector("#ytdual-btn-opts").addEventListener("click", () => {
-    browser.runtime.sendMessage({ type: "ytdual-open-options" });
-  });
+  const bar = make("div", { id: "ytdual-bar" }, [
+    make("button", {
+      id: "ytdual-btn-toggle", title: "이중 자막 켜기/끄기 (Alt+Y)", text: "자막",
+      on: { click: toggle },
+    }),
+    make("button", {
+      id: "ytdual-btn-opts", title: "설정", text: "⚙",
+      on: { click: () => browser.runtime.sendMessage({ type: "ytdual-open-options" }) },
+    }),
+  ]);
   document.body.appendChild(bar);
   syncBar();
 }
