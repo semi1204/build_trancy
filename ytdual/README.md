@@ -4,10 +4,70 @@
 자막은 확장이 브라우저에서 직접 가져오고, Worker는 번역과 카드 큐만 담당합니다.
 서버가 유튜브에 접속하지 않으므로 봇 차단·프록시 문제가 없습니다.
 
+## 0. 로컬 YouTube fixture
+
+실제 영상의 전체 자막만 먼저 저장하거나, 자막과 처음 45초 음성을 함께 로컬
+fixture로 저장해 반복 테스트할 수 있습니다. 본인 소유이거나 테스트 사용 권한이
+있는 공개 영상만 사용하세요.
+
+저장소 루트에서 실행하며, 자막 전용 수집에는 최신 `yt-dlp`가 필요합니다. 음성까지
+수집할 때는 `ffmpeg`/`ffprobe`도 필요합니다.
+Deno가 있으면 YouTube의 현재 플레이어 스크립트 해석에 사용합니다. macOS에서 오래된
+`yt-dlp`가 403을 내면 먼저 `brew upgrade yt-dlp`로 갱신하세요. 별도 실행 파일을
+쓸 때는 `YT_DLP_BIN=/path/to/yt-dlp`를 지정할 수 있습니다. 수집기는 전역 yt-dlp
+설정·쿠키·플러그인·원격 컴포넌트를 사용하지 않습니다.
+
+```bash
+# 전체 영어 자막만 수집 (오디오 다운로드 없음)
+npm run fixture:transcript -- \
+  'https://www.youtube.com/watch?v=M7lc1UVf-VE' \
+  --lang en
+
+# 자막 전용 fixture 검증
+npm run fixture:check -- .local/youtube-transcripts/M7lc1UVf-VE
+
+# 영어 자막 + WebM/Opus 음성 45초 수집
+npm run fixture:capture -- \
+  'https://www.youtube.com/watch?v=M7lc1UVf-VE' \
+  --lang en --seconds 45
+
+# SHA-256, JSON3→세그먼트 변환, 오디오 형식/길이 재검증
+npm run fixture:check -- .local/youtube/M7lc1UVf-VE
+```
+
+자막 전용 산출물은 `.local/youtube-transcripts/<video-id>/`, 음성 포함 산출물은
+`.local/youtube/<video-id>/`에 생기며 둘 다 Git에서 제외됩니다.
+`--seconds` 구간 안에 실제 자막이 하나도 없으면 불완전한 fixture를 남기지 않고
+실패합니다.
+
+- `audio.webm`: 음성 포함 모드에서만 생성되는 WebM/Opus 오디오
+- `captions.<lang>.json3`: YouTube 원본 자막
+- `transcript.json`: `/api/subtitle`에 바로 보낼 수 있는 요청 본문
+- `transcript.txt`, `transcript.vtt`: 사람이 읽거나 로컬 플레이어에서 확인할 파일
+- `manifest.json`: 출처, 수집 도구 버전, 파일 크기와 SHA-256
+
+로컬 Worker까지 테스트하려면 Wrangler(`npm install -g wrangler`)가 필요합니다.
+`ytdual/worker/.dev.vars`에 필요한 키를 설정하고 터미널 두 개에서 다음처럼
+실행합니다. `/api/transcribe`와 `/api/subtitle`은 각각 음성/자막을 Groq/OpenAI로
+전송해 실제 API를 호출하므로 비용이 발생할 수 있습니다. 개발 서버는 인증 없이
+localhost API를 열므로 테스트가 끝나면 종료하고, 실행 중에는 신뢰하지 않는 웹
+페이지를 열어 두지 마세요.
+
+```bash
+npm run dev
+
+curl -sS -F file=@.local/youtube/M7lc1UVf-VE/audio.webm \
+  -F language=en http://127.0.0.1:8787/api/transcribe
+
+curl -sS -H 'content-type: application/json' \
+  --data-binary @.local/youtube/M7lc1UVf-VE/transcript.json \
+  http://127.0.0.1:8787/api/subtitle
+```
+
 ## 1. Worker 배포
 
 ```bash
-cd worker
+cd ytdual/worker
 npm install -g wrangler
 wrangler login
 

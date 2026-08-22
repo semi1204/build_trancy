@@ -1,3 +1,5 @@
 ytdual/worker/.dev.vars
 .DS_Store
 ytdual/worker/.wrangler/
+node_modules/
+.local/

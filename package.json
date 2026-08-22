@@ -1,0 +1,18 @@
+{
+  "name": "ytdual",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "유튜브 이중 자막 + Anki 문장 카드",
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "test:watch": "node --test --watch test/*.test.js",
+    "test:e2e": "YTDUAL_E2E=1 node --test test/worker.test.js",
+    "fixture:capture": "node scripts/capture-youtube-fixture.mjs",
+    "fixture:transcript": "node scripts/capture-youtube-fixture.mjs --transcript-only",
+    "fixture:check": "node scripts/verify-youtube-fixture.mjs",
+    "bench": "node scripts/bench-translation.mjs",
+    "check": "node --check ytdual/extension/content.js && node --check ytdual/worker/src/index.js && node --check scripts/capture-youtube-fixture.mjs && node --check scripts/verify-youtube-fixture.mjs",
+    "dev": "wrangler dev --config ytdual/worker/wrangler.toml --port 8787"
+  }
+}
