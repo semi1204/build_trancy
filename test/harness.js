@@ -43,6 +43,7 @@ const EPILOGUE = `
   chooseSource,
   panelTrack,
   pickTrack,
+  runtimeUrlFor,
   parseTimestamp,
 };
 `;

@@ -105,6 +105,15 @@ test("워커 엔드포인트가 manifest 의 host_permissions 안에 있다", ()
  * background 는 확장 출처로 요청하므로 그 판정을 받지 않는다. 그래서 워커 호출은
  * 전부 background 를 거쳐야 한다.
  */
+// TODO(phase6): 여기에 브리지 정합성 검사 3개를 추가한다.
+//   1) content.js 의 PAGE_REQ/PAGE_RES 값이 ytpage.js 의 YTDUAL_PAGE_REQ/RES 값과
+//      같은가. ★ 이름이 아니라 값을 비교할 것 — 두 파일의 상수 이름은 일부러 다르다
+//      (페이지 세계는 유튜브와 전역을 공유해 접두사가 필요하고, 격리 세계는 아니다).
+//      한쪽만 고치면 브리지는 오류 없이 조용히 죽고 "가끔 자막이 안 뜬다"로만 보인다.
+//   2) manifest 가 ytpage.js 를 world:"MAIN" 으로 올리는가. 격리 세계로 올라가면
+//      #movie_player.getAudioTrack() 이 undefined 라 이 파일 전체가 무의미해진다.
+//   3) ytpage.js 가 트랙을 고르지 않는가 (I29) — pickTrack/score/sort 같은 선택
+//      로직이 페이지 세계로 새면 node 테스트가 실물의 절반만 보게 된다.
 const backgroundJs = read("background.js");
 
 test("★ content.js 는 워커를 직접 부르지 않는다 — background 를 거친다", () => {

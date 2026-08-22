@@ -82,7 +82,9 @@ test("지역 변종(en-US)도 원어 en 과 일치로 본다", () => {
 
 test("자동 번역 파생 트랙은 후보에서 제외한다", () => {
   const y = withPrefer("ko");
-  // vssId 가 "."(translated) 로 시작하거나 translatedLanguage 가 붙은 트랙
+  // 판정 근거는 translatedLanguage 하나뿐이다. vssId 는 아니다 —
+  // "." 은 사람이 올린 자막, "a." 가 ASR 이다 (거꾸로 알아서 사람 자막을 전부
+  // 걸러내던 시절이 있었다. content.js 의 pickTrack 주석 참조).
   const translated = { ...manual("ko"), vssId: ".ko", translatedLanguage: { languageCode: "ko" } };
   const p = player([translated, manual("en")], { defaultAudioLanguage: "en" });
   assert.equal(y.pickTrack(p).languageCode, "en");
