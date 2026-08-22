@@ -331,10 +331,14 @@ function pickTrack(player) {
   const tracks = renderer?.captionTracks || [];
   if (!tracks.length) return null;
 
-  // 자동 번역으로 파생된 트랙은 원문이 아니다 — 유튜브가 다른 언어 자막을 기계
-  // 번역한 것이라 원문 대조에 쓸 수 없다. 다만 후보가 그것뿐이면 빈손보다 낫다.
-  const isTranslated = (t) => !!t.translatedLanguage || String(t.vssId || "").startsWith(".");
-  const pool = tracks.filter((t) => !isTranslated(t));
+  // 자동 번역으로 파생된 트랙은 원문이 아니다. 실측상 그런 트랙은 captionTracks 에
+  // 아예 안 들어오지만(translationLanguages 로 따로 온다), 들어오면 걸러낸다.
+  //   ★ 예전엔 vssId 가 "." 으로 시작하면 번역으로 봤는데 정반대였다. 유튜브 규약은
+  //     "." = 사람이 올린 자막, "a." = ASR 이다. 그 오해 때문에 사람 자막을 전부
+  //     걸러내고 늘 ASR 을 썼다.
+  //     [실측 6개 영상: M7lc1UVf-VE(.en+a.en), gIwvFMiJNVU(.es+a.es),
+  //      MenYHcLC16M(.ko+a.ko), R2vXbFp5C9o(.en-US+a.en) 전부 ASR 이 뽑혔다]
+  const pool = tracks.filter((t) => !t.translatedLanguage);
   const cands = pool.length ? pool : tracks;
 
   // 원어 판정. 앞쪽일수록 근거가 강하다.
@@ -347,8 +351,17 @@ function pickTrack(player) {
     cfg.prefer ||
     null;
 
+  // trackName 은 업로더가 같은 언어에 여러 트랙을 올릴 때 붙이는 꼬리표다. 보통
+  // 트랙은 "" 이고, 값이 있으면 "본편 자막이 아닌 무언가"다 — 채팅 로그, 코멘터리,
+  // 강제 자막 같은 것들. 말소리를 원하는 우리에겐 후순위다. 다만 배제하지는
+  // 않는다. 그것뿐이면 없는 것보다 낫다.
+  //   [실측 6개 영상 12트랙: 정상 트랙은 전부 trackName="" 이고,
+  //    "English (United States) - Twitch Chat" 만 trackName="Twitch Chat" 이었다.
+  //    유튜브 자신은 이 채팅 트랙을 audioTracks 의 기본값으로 지목한다 — 그래서
+  //    defaultCaptionTrackIndex 는 이 판단에 쓸 수 없다]
   const score = (t) =>
-    (sameLang(t.languageCode, origin) ? 4 : 0) +
+    (sameLang(t.languageCode, origin) ? 8 : 0) +
+    (t.trackName ? 0 : 4) +
     (t.kind === "asr" ? 0 : 2) +
     (sameLang(t.languageCode, cfg.prefer) ? 1 : 0);
 
