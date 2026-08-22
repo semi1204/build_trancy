@@ -6,7 +6,11 @@
  *   4. <video> 위 오버레이 렌더
  *   5. 자막 단어를 탭하면 문장 카드로 저장 → Worker 큐 → PC 에서 Anki 로
  *
- * 유튜브 DOM 의존은 querySelector('video') 하나뿐입니다.
+ * 유튜브 DOM 의존 (한때 querySelector('video') 하나뿐이라고 적혀 있었으나 거짓이다):
+ *   video            재생 시각·길이·오디오 탭
+ *   #movie_player    자막 위치를 컨트롤 바 위로 올릴지 판단 (ytp-autohide)
+ *   스크립트 패널     transcript-segment-view-model 외 5종 — timedtext 폴백 경로
+ * 쓰기는 우리 오버레이뿐이다. native 자막은 클래스 하나로만 숨긴다 (I14).
  */
 
 const DEFAULTS = {
@@ -93,6 +97,50 @@ const DEFAULTS = {
  *  I23 모든 원문 줄은 정확히 한 청크의 [t0, t1] 에 완전히 포함된다. 즉 제거 책임이
  *      유일하다. 이 성질이 I5 의 구멍을 막는 근거다 — "완전히 포함"으로 지우면
  *      각 조각은 자기 소유 청크에 의해 정확히 한 번 제거된다.
+ *
+ * 자막 원천 — 페이지 세계 브리지 (전부 Phase 4 에서 실제 브라우저로 확인)
+ *  I24 수집 구간의 모든 await 뒤에서 세대를 확인한다. 어긋나면 그 자리에서 반환한다.
+ *      번역 러너는 이미 세대로 보호되는데 수집 구간만 구멍이었다. 영상을 빠르게
+ *      넘기면 늦게 끝난 옛 start() 가 seedRawLines 로 새 세션의 state.lines 를
+ *      덮어쓴다. 대상은 셋이다 — 플레이어 확보, timedtext, 패널 수집.
+ *
+ *  I25 브리지가 없거나 늦은 것은 실패가 아니라 강등이다. 기존 경로(정적 baseUrl)로
+ *      내려가되 새 실패 모드를 만들지 않는다. 강등 사실은 via 로 남긴다.
+ *      ★ 단 강등한 경로가 지금은 사실상 죽어 있다 (I30 참조). 그래도 강등을 유지하는
+ *        이유는, 브리지 도입이 "되던 것을 깨는" 변경이 되지 않게 하기 위해서다.
+ *
+ *  I26 세계 경계를 넘는 대기는 유한하고, 호출자의 상한이 피호출자의 상한보다 크다.
+ *      ★ 이걸 어겨서 실제로 사고가 났다. requestPageData 가 3초에 포기하는데
+ *        ytpage 의 runtimeTracks 는 5초까지 폴링했다. 그 결과 pot 이 늦게 붙는
+ *        콜드 스타트에서 조용히 정적 URL 로 강등됐고, 사용자에게는 "유튜브가 막고
+ *        있습니다"라는 거짓 메시지가 떴다. 클라 상한을 7초로 올리자 즉시 3590줄이
+ *        들어왔다. [실측 VBMUMuZBxw0]
+ *      이것은 I12(클라 타임아웃 > 워커 최대 시간)와 같은 결함이 새 경계에서 재발한
+ *      것이다. I12 는 워커 경계, I26 은 세계 경계 — 규칙은 하나다.
+ *
+ *  I27 트랙 대조 결과가 정확히 하나가 아니면 URL 을 쓰지 않는다. 0개도 2개도 강등이다.
+ *      틀린 URL 은 "자막이 안 나온다"가 아니라 "다른 트랙의 자막이 나온다"로 끝난다 —
+ *      채팅 로그를 자막으로 띄웠던 사고와 같은 종류다. 애매하면 안 쓰는 것이 맞다.
+ *
+ *  I28 페이지 세계에서 온 자료는 videoId 를 대조하기 전에는 쓰지 않는다. 세계 사이
+ *      왕복 중에 SPA 이동이 일어날 수 있고, window.ytInitialPlayerResponse 는 이동
+ *      뒤에도 갱신되지 않을 수 있어 이전 영상의 트랙 목록이 남는다.
+ *
+ *  I29 판단은 전부 이 파일에 있다. 페이지 세계는 본 것을 보고만 한다 (ytpage.js 참조).
+ *      트랙 선택이 그쪽으로 새면 node 테스트가 실물의 절반만 보게 된다.
+ *
+ *  I30 우리가 보내는 모든 timedtext 요청은 pot 과 c 를 함께 갖춘다. 하나만으로는
+ *      안 된다.
+ *      [실측 20조합, VBMUMuZBxw0 ASR 트랙:
+ *         런타임(pot) + json3 + c=WEB → 2,205,893 bytes / 7181 cue  ★
+ *         런타임(pot) + json3, c 없음 → 200 + 빈 본문
+ *         정적(pot 없음) + 어떤 조합이든(10종) → 200 + 빈 본문]
+ *      pot 은 #movie_player 가 초기화된 뒤의 런타임 URL 에만 붙고, c 값은 페이지
+ *      세계의 ytcfg 에만 있다. 둘 다 격리 세계에서 얻을 수 없다 — 그것이 ytpage.js 가
+ *      존재하는 이유 전부다.
+ *      ★ json3 는 계속 쓸 수 있다. srv3 로 갈아탈 이유가 없고 fixture 15개도 유효하다.
+ *      ★ 정적 baseUrl 은 이제 잘 되던 영상에서도 빈 본문이다
+ *        [M7lc1UVf-VE, gIwvFMiJNVU 확인]. 즉 브리지는 개선이 아니라 복구다.
  *
  * ──────────────────────────────────────────────────────────────────── */
 
@@ -229,12 +277,9 @@ function sliceBalancedJSON(src, openIdx) {
   return null;
 }
 
-/** 이미 로드된 문서의 <script> 에서 ytInitialPlayerResponse 를 읽는다.
- *  못 찾으면 null — 호출부가 fetchPlayerResponse() 로 폴백한다.
- *  @returns {object|null} */
-function readPlayerResponseFromDOM() {
-  throw new Error("not implemented");
-}
+/* readPlayerResponseFromDOM() 이 여기 있었다. 호출자 0, 본문은 throw 뿐이었다.
+ * 하려던 일(문서의 <script> 에서 ytInitialPlayerResponse 를 긁기)은 페이지 세계에서
+ * window.ytInitialPlayerResponse 를 그냥 읽는 쪽이 낫다 — ytpage.js 참조. */
 
 async function fetchPlayerResponse(videoId) {
   const res = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
@@ -404,36 +449,174 @@ function panelTrack(player) {
   return Number.isInteger(i) ? (tracks[i] ?? null) : tracks[0];
 }
 
+// ── 2b. 페이지 세계 브리지 ───────────────────────────────────────────
+/* 왜 필요한지는 ytpage.js 머리말에 있다. 요약: captionTracks[].baseUrl 은 정적
+ * 응답이라 pot 이 없고, pot 없는 timedtext 는 200 + 빈 본문이 온다. 플레이어가
+ * 초기화된 뒤 노출하는 런타임 URL 에만 pot 이 붙는다.
+ *
+ * ★ 이 세 문자열은 ytpage.js 에도 같은 값으로 있다. 세계가 달라 import 가
+ *   불가능하므로 중복이 불가피하다. 한쪽만 고치면 브리지는 오류 없이 조용히
+ *   죽고 증상은 "가끔 자막이 안 뜬다"로만 보인다. 정적 검사로 묶어야 한다. */
+const PAGE_REQ = "ytdual-get-page-data";
+const PAGE_RES = "ytdual-page-data";
+const PAGE_CANCEL = "ytdual-cancel-page-data";
+
+/** 페이지 세계가 준비될 때까지 기다릴 상한.
+ *  requestPageData 의 인자로 두지 않은 이유 — 호출부가 하나뿐이고 값도 하나다.
+ *  인자로 만들면 "부르는 쪽마다 다른 값을 줄 수 있다"는 거짓 여지가 생긴다.
+ *
+ *  ★ I26 — 이 값은 ytpage.js 의 runtimeTracks 폴링 상한보다 반드시 커야 한다.
+ *    두 숫자는 짝이다. 한쪽만 고치면 호출자가 먼저 포기해 조용히 강등되고, 사용자는
+ *    "유튜브가 막고 있습니다"라는 거짓 메시지를 본다 (Phase 4 에서 실제로 발생:
+ *    클라 3000 vs 페이지 5000 → VBMUMuZBxw0 실패. 클라를 7000 으로 올리자 3590줄).
+ *    ytpage.js 의 PAGE_POLL_MS 는 4000 이다. 여기는 그보다 크게 잡는다 — 페이지
+ *    세계가 상한까지 폴링한 뒤 응답을 만들어 보낼 시간까지 포함해야 하기 때문이다.
+ *    [실측 근거는 ytpage.js 의 PAGE_POLL_MS 주석에 있다] */
+const PAGE_DATA_TIMEOUT_MS = 5000;
+
+/** 페이지 세계에 자료를 요청한다. CustomEvent 왕복 1회.
+ *
+ *  @param {AbortSignal} signal  stop() 이 이 세대의 리스너와 타이머도 즉시 걷는다.
+ *  @returns {Promise<PageData|null>} 브리지가 없거나 늦거나 세대가 끝나면 null.
+ *    null 은 실패가 아니라 "강등"이다 — 호출부는 지금까지 하던 대로
+ *    fetchPlayerResponse + baseUrl 로 진행해야 한다. 새 실패 모드를 만들지 않는다.
+ *
+ *  ★ 반환된 PageData.videoId 를 호출부가 반드시 대조해야 한다. 세계 사이 왕복 중에
+ *    SPA 이동이 일어날 수 있다. */
+async function requestPageData(signal) {
+  // 문서 전역 채널이다. dev/stable 두 인스턴스가 함께 있어도 ID 가 겹치면 안 된다.
+  const requestId = crypto.randomUUID();
+  const responseEvent = `${PAGE_RES}:${requestId}`;
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (v) => {
+      if (settled) return;                    // 응답·중단·타임아웃이 겹칠 수 있다
+      settled = true;
+      clearTimeout(timer);
+      document.removeEventListener(responseEvent, onRes);
+      signal?.removeEventListener("abort", onAbort);
+      resolve(v);
+    };
+    const onRes = (e) => { try { finish(JSON.parse(e.detail)); } catch { finish(null); } };
+    const cancelPage = () => {
+      document.dispatchEvent(new CustomEvent(PAGE_CANCEL, { detail: requestId }));
+    };
+    const onAbort = () => { cancelPage(); finish(null); };
+    const timer = setTimeout(() => { cancelPage(); finish(null); }, PAGE_DATA_TIMEOUT_MS);   // I26
+    document.addEventListener(responseEvent, onRes);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) { finish(null); return; }
+    document.dispatchEvent(new CustomEvent(PAGE_REQ, { detail: requestId }));
+  });
+}
+
+/** pickTrack 이 고른 트랙에 대응하는 런타임 URL 을 찾는다.
+ *
+ *  왜 트랙을 여기서 다시 고르지 않는가 — 런타임 트랙 목록은 playerResponse 와
+ *    필드가 다르다(ytpage.js 의 RawTrack 참조). vssId·kind·trackName 이 있는지도
+ *    확인되지 않았다. 그 목록으로 pickTrack 을 돌리면 vssId 규약 결함과 Twitch Chat
+ *    오선택을 잡아낸 104개 테스트가 전부 헛것이 된다.
+ *    그래서 선택은 playerResponse 로 끝내고, 이 함수는 URL 조회표 역할만 한다.
+ *
+ *  ★ 대조를 틀리면 다른 트랙의 자막을 가져온다 — panelTrack 이 막은 것과 똑같은
+ *    종류의 사고다. 그래서 순수 함수로 둔다. node 테스트로 규칙을 고정할 수 있어야
+ *    한다 (이 파일에서 DOM·네트워크를 안 만지는 몇 안 되는 신규 함수).
+ *
+ *  불변식
+ *    I27 반환은 후보가 정확히 하나일 때만 URL 이다. 0개도 2개도 null 이다.
+ *    I30 pot 이 없는 런타임 트랙은 후보가 아니다. pot 없는 URL 은 어차피 빈 본문이라
+ *        (I30 실측) 정적 baseUrl 과 다를 바 없고, "런타임을 썼다"는 via 만 거짓이 된다.
+ *
+ *  ★ 인덱스로 대조하지 않는다. 런타임 목록과 정적 목록은 순서가 다르다.
+ *    [실측 VBMUMuZBxw0 — 런타임 [.en-US(채팅), a.en], 정적 [a.en, .en-US(채팅)] 역순.
+ *     인덱스로 짰다면 ASR 을 고르고 채팅 URL 을 가져왔을 것이다]
+ *    vssId 는 양쪽이 같은 값이다 [같은 실측] — 그래서 vssId 가 1순위 근거다.
+ *
+ *  @param {object} track          pickTrack 이 고른 트랙 (playerResponse 쪽 모양)
+ *  @param {RawTrack[]} rawTracks  페이지 세계가 보고한 런타임 트랙
+ *  @returns {string|null} 확실히 같은 트랙일 때만 URL. 애매하면 null —
+ *    null 이면 호출부가 baseUrl 로 강등한다. 틀린 URL 보다 강등이 낫다. */
+function runtimeUrlFor(track, rawTracks) {
+  if (!track || !Array.isArray(rawTracks)) return null;
+  // I30: pot 없는 URL 은 어차피 빈 본문이다. 후보로 삼으면 via 만 거짓이 된다.
+  const pool = rawTracks.filter((t) => t && t.url && t.hasPot);
+  if (!pool.length) return null;
+
+  // 1순위 vssId — 양쪽이 같은 값을 준다 [실측]. 순서는 다르므로 인덱스는 금물이다.
+  if (track.vssId) {
+    const m = pool.filter((t) => t.vssId === track.vssId);
+    if (m.length) return m.length === 1 ? m[0].url : null;      // I27
+  }
+
+  // 2순위 언어 + ASR 여부. vssId 가 없거나 그 값으로 못 찾았을 때만 내려온다.
+  const isAsr = (x) => x.kind === "asr" || String(x.vssId || "").startsWith("a.");
+  const m = pool.filter((t) => sameLang(t.languageCode, track.languageCode) && isAsr(t) === isAsr(track));
+  return m.length === 1 ? m[0].url : null;                       // I27
+}
+
 /**
  * @typedef {object} FetchResult  자막 수집 한 경로의 결과
  * @property {Segment[]} segments  실패하면 빈 배열
  * @property {"ok"|"no-track"|"empty-body"|"http-error"|"parse-error"|"no-panel"|"panel-other-track"} reason
+ * @property {"runtime"|"static"|"panel"} [via]  어느 URL 로 받아온 결과인가.
  *
  * 왜 빈 배열만으로는 안 되나 — "자막이 없다"와 "수집이 실패했다"가 같은 값이 되면
  *   호출부가 둘을 구분할 수 없고, 그래서 수집 실패에도 Whisper 전사가 돌았다.
  *   전사는 유료이고 사용자는 자막이 있는 영상인 줄 알므로 사고를 알아채지 못한다.
+ *
+ * via 가 왜 reason 과 별개인가 — 둘은 다른 질문에 답한다. reason 은 "어떻게 됐나",
+ *   via 는 "무엇으로 시도했나"다. 합치면 empty-body 가 두 가지 뜻을 갖게 된다:
+ *     static  + empty-body → pot 이 없어서 막힌 것. 런타임 URL 로 뚫릴 수 있다
+ *     runtime + empty-body → pot 을 붙이고도 막힌 것. 이 영상은 정말 안 된다
+ *   사용자에게 할 말이 정반대다. 지금 chooseSource 의 실패 문구는 전자만 가정하고
+ *   "유튜브가 막고 있다"고 단정하는데, 런타임 경로가 생기면 그 말이 거짓이 될 수 있다.
+ *
+ *   ★ 실패 사유를 새로 만들지 않은 이유 — 런타임 URL 을 못 찾는 것은 실패가 아니다.
+ *     그때는 지금까지 쓰던 정적 baseUrl 로 내려가면 그만이고, 그게 현재 동작이다.
+ *     ("브리지 없음" 을 실패로 만들면 지금 잘 되는 영상들이 새로 깨진다.)
  */
-async function fetchSegments(track) {
+/** @param {object} track  pickTrack 이 고른 트랙. runtimeUrl 이 없을 때 baseUrl 을 쓴다
+ *  @param {string|null} runtimeUrl  runtimeUrlFor 가 찾아낸 pot 붙은 URL. 없으면 null
+ *
+ *  왜 (url, via) 두 개가 아니라 track 을 계속 받는가 — timedtext URL 을 어떻게
+ *    마감하는지(fmt·c 파라미터)는 이 함수 하나만 알아야 한다. 호출부가 완성된 URL 을
+ *    넘기게 하면 그 지식이 밖으로 새고, baseUrl 폴백까지 호출부가 떠안는다.
+ *
+ *  불변식
+ *    I30 여기서 나가는 요청은 pot 과 c 를 함께 갖춘다. 이 함수가 우리 코드에서
+ *        timedtext URL 을 만드는 유일한 자리이므로, I30 은 여기서만 지키면 된다.
+ *        c 값은 페이지 세계에서 온 것을 쓴다 — 격리 세계에는 ytcfg 가 없다.
+ *        하드코딩 "WEB" 은 오늘은 맞지만, 유튜브가 클라이언트 이름을 바꾸는 순간
+ *        모든 영상이 조용히 빈 본문이 된다. 조용한 전면 실패는 피한다.
+ *    I25 runtimeUrl 이 null 이어도 던지지 않는다. baseUrl 로 강등하고 via 에 남긴다.
+ *
+ *  ★ 반환에 실린 via 는 장식이 아니다. empty-body 의 뜻을 가른다:
+ *      static  + empty-body → pot 없이만 시도했다. "막혔다"고 단정하면 거짓말이다
+ *      runtime + empty-body → pot·c 를 갖추고도 막혔다. 그때는 단정해도 맞다
+ *    Phase 4 에서 이 구분이 없어 사용자에게 거짓 메시지가 나가는 것을 실제로 봤다. */
+async function fetchSegments(track, runtimeUrl = null, client = "WEB") {
+  const via = runtimeUrl ? "runtime" : "static";               // I25
   let res;
   try {
-    const url = new URL(track.baseUrl);
+    const url = new URL(runtimeUrl || track.baseUrl);
     url.searchParams.set("fmt", "json3");
+    url.searchParams.set("c", client || "WEB");                // I30
     res = await fetch(url.toString(), { credentials: "include" });
   } catch (e) {
-    return { segments: [], reason: "http-error" };
+    return { segments: [], reason: "http-error", via };
   }
-  if (!res.ok) return { segments: [], reason: "http-error" };
+  if (!res.ok) return { segments: [], reason: "http-error", via };
   // 2024년부터 pot(PoToken) 없는 요청에 200 + 빈 본문을 주는 경우가 있다.
   // 이건 "자막 없음"이 아니라 "막힘"이다 — 구분해서 올려야 전사 오발동을 막는다.
   const body = await res.text();
-  if (!body.trim()) return { segments: [], reason: "empty-body" };
+  if (!body.trim()) return { segments: [], reason: "empty-body", via };
   try {
     const segments = parseJson3Segments(JSON.parse(body));
     return segments.length
-      ? { segments, reason: "ok" }
-      : { segments: [], reason: "empty-body" };
+      ? { segments, reason: "ok", via }
+      : { segments: [], reason: "empty-body", via };
   } catch {
-    return { segments: [], reason: "parse-error" };
+    return { segments: [], reason: "parse-error", via };
   }
 }
 
@@ -522,6 +705,15 @@ function chooseSource(player, cap, panel) {
   if (panel.reason === "ok") return { kind: "captions", segments: panel.segments, reason: "panel" };
   if (!tracks.length) return { kind: "asr", reason: "no-track" };
 
+  // 여기서 via 가 결정적이다. 같은 empty-body 라도 뜻이 정반대다:
+  //   static  → pot·c 없이만 시도했다. "유튜브가 막았다"고 단정하면 거짓말이다
+  //   runtime → 갖출 것을 갖추고도 막혔다. 그때만 단정할 수 있다
+  if (cap.via === "static" && cap.reason === "empty-body") {
+    return {
+      kind: "fail",
+      reason: "자막 주소를 준비하지 못했습니다. 영상을 재생한 뒤 자막 버튼을 다시 눌러 주세요",
+    };
+  }
   if (panel.reason === "panel-other-track") {
     return {
       kind: "fail",
@@ -531,7 +723,8 @@ function chooseSource(player, cap, panel) {
   }
   return {
     kind: "fail",
-    reason: `자막 트랙은 있는데 수집에 실패했습니다 (timedtext: ${cap.reason}, 패널: ${panel.reason})`,
+    reason: `자막 트랙은 있는데 수집에 실패했습니다 (timedtext: ${cap.reason}` +
+      `${cap.via ? "/" + cap.via : ""}, 패널: ${panel.reason})`,
   };
 }
 
@@ -672,12 +865,25 @@ async function appendAsrLines(segments) {
   segments = normalizeSegments(segments, null);   // 전사분도 같은 규칙을 통과시킨다
   let lines;
   try {
-    lines = await requestTranslation(`${state.videoId}#asr`, cfg.prefer || "auto", segments, {
+    // ★ .lines 를 벗겨야 한다. requestTranslation 은 {lines, usage} 를 준다 —
+    //   래퍼째 concat 하면 배열이 아니므로 원소 하나로 붙고, 그 객체엔 start 가
+    //   없어서 어떤 시각에도 매칭되지 않는다. 결과가 뒤집힌다: 번역이 성공하면
+    //   아무것도 안 보이고, 실패했을 때만(아래 catch 가 올바른 모양을 만들어서)
+    //   원문이 보인다. 자막 트랙이 없는 영상에서만 도는 경로라 오래 안 드러났다.
+    //   바로 옆 mergeTranslated 는 배열을 받으므로 같은 실수를 하지 않는다.
+    ({ lines } = await requestTranslation(`${state.videoId}#asr`, cfg.prefer || "auto", segments, {
       before: state.lines.slice(-8).map((l) => l.orig),   // 직전 자막을 문맥으로
-    });
+    }));
+    // Line 계약상 translated 는 필수다. 지금은 전사 줄이 병합을 타지 않아 티가 안
+    // 나지만, 빠져 있으면 나중에 mergeTranslated 가 이 줄들을 "아직 번역 안 된 줄"로
+    // 보고 지운다 (I4). 워커 응답에는 이 필드가 없으므로 여기서 찍는다 —
+    // 자막 경로에서 mergeTranslated 가 하는 일과 같다.
+    lines = lines.map((l) => ({ ...l, translated: true }));
   } catch (e) {
     log("전사분 번역 실패, 원문만 표시", e.message);
-    lines = segments.map((s) => ({ start: s.start, end: s.end, orig: s.text, trans: "" }));
+    lines = segments.map((s) => ({
+      start: s.start, end: s.end, orig: s.text, trans: "", translated: false,
+    }));
   }
   state.lines = state.lines.concat(lines).sort((a, b) => a.start - b.start);
   state.idx = -2;                          // 다음 render 에서 다시 그리게
@@ -1162,11 +1368,17 @@ async function start() {
 
   try {
     showStatus("자막 트랙 확인 중", true);
-    // TODO(phase6): readPlayerResponseFromDOM() 을 먼저 시도하고 null 일 때만
-    //   fetchPlayerResponse(videoId) 로 폴백한다. 여기서 인라인으로 처리하고 래퍼 함수는
-    //   만들지 않는다 (호출자가 하나뿐). 같은 페이지 HTML 을 네트워크로 다시 받는 낭비 제거.
-    //   단 Phase 4 에서 perf.tPlayer 가 1초 미만이면 이 항목은 통째로 버린다.
-    const player = await fetchPlayerResponse(videoId);
+    // 페이지 세계가 pot 붙은 런타임 트랙과 ytInitialPlayerResponse 를 함께 준다.
+    // 없거나 늦으면 null 이고, 그때는 지금까지 하던 대로 진행한다 (I25).
+    const page = await requestPageData(sig);
+    if (myGen !== state.gen) return;                            // I24
+    // I28: 왕복 중 SPA 이동이 있었으면 남의 영상 자료다. 대조 전에는 쓰지 않는다.
+    const pageOk = !!page && page.videoId === videoId;
+    if (page && !pageOk) log("페이지 자료가 다른 영상의 것이라 버림", page.videoId);
+
+    // player 를 페이지 세계에서 얻으면 watch 페이지 HTML 왕복이 통째로 사라진다.
+    const player = (pageOk && page.player) || await fetchPlayerResponse(videoId);
+    if (myGen !== state.gen) return;                            // I24
     state.perf.tPlayer = performance.now() - state.perf.t0;
     state.title = player?.videoDetails?.title || document.title;
 
@@ -1176,8 +1388,16 @@ async function start() {
     let panel = { segments: [], reason: "no-panel" };
     if (track) {
       showStatus("자막 불러오는 중", true);
-      cap = await fetchSegments(track)
-        .catch((e) => (log("timedtext 실패", e.message), { segments: [], reason: "http-error" }));
+      // 선택은 위의 pickTrack 이 끝냈다. 런타임 목록은 URL 조회표로만 쓴다 (I29).
+      const rurl = pageOk ? runtimeUrlFor(track, page.tracks || []) : null;
+      // 강등했으면 이유를 함께 남긴다. 정적 URL 은 지금 사실상 빈 본문만 주므로
+      // (I30) 이 줄이 곧 "왜 자막이 안 나왔는가"의 유일한 단서다.
+      log(`트랙 ${track.vssId || track.languageCode} → ` +
+        (rurl ? "런타임 URL(pot)" : `정적 baseUrl (페이지 세계: ${page ? page.reason : "무응답"})`));
+      cap = await fetchSegments(track, rurl, pageOk ? page.client : "WEB")
+        .catch((e) => (log("timedtext 실패", e.message),
+          { segments: [], reason: "http-error", via: rurl ? "runtime" : "static" }));
+      if (myGen !== state.gen) return;                          // I24
       if (cap.reason !== "ok") {
         // 패널은 유튜브의 기본 트랙만 보여준다. 우리가 고른 것과 다르면 긁어봐야
         // 다른 자막이 온다 — 채팅 로그를 자막으로 띄우느니 실패가 낫다.
@@ -1188,6 +1408,7 @@ async function start() {
           log(`timedtext 실패(${cap.reason}) → 스크립트 패널에서 수집`);
           panel = await scrapeTranscriptPanel()
             .catch((e) => (log("패널 수집 실패", e.message), { segments: [], reason: "no-panel" }));
+          if (myGen !== state.gen) return;                      // I24
         }
       }
     }

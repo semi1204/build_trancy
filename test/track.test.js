@@ -82,7 +82,9 @@ test("지역 변종(en-US)도 원어 en 과 일치로 본다", () => {
 
 test("자동 번역 파생 트랙은 후보에서 제외한다", () => {
   const y = withPrefer("ko");
-  // vssId 가 "."(translated) 로 시작하거나 translatedLanguage 가 붙은 트랙
+  // 판정 근거는 translatedLanguage 하나뿐이다. vssId 는 아니다 —
+  // "." 은 사람이 올린 자막, "a." 가 ASR 이다 (거꾸로 알아서 사람 자막을 전부
+  // 걸러내던 시절이 있었다. content.js 의 pickTrack 주석 참조).
   const translated = { ...manual("ko"), vssId: ".ko", translatedLanguage: { languageCode: "ko" } };
   const p = player([translated, manual("en")], { defaultAudioLanguage: "en" });
   assert.equal(y.pickTrack(p).languageCode, "en");
@@ -195,4 +197,74 @@ test("유튜브의 defaultCaptionTrackIndex 는 믿지 않는다", () => {
     { vssId: ".en-US._x", languageCode: "en-US", trackName: "Twitch Chat", baseUrl: "u" },
   ], {}, [{ defaultCaptionTrackIndex: 1 }]));
   assert.equal(t.kind, "asr");
+});
+
+/* ── runtimeUrlFor — pickTrack 이 고른 트랙의 pot 붙은 URL 찾기 ──────
+ * 유튜브는 pot 없는 timedtext 요청에 200 + 빈 본문을 준다. pot 은 정적
+ * ytInitialPlayerResponse 의 baseUrl 에는 없고, 플레이어가 초기화된 뒤 노출하는
+ * #movie_player.getAudioTrack().captionTracks[].url 에만 붙는다.
+ *
+ * 그래서 "고르기"와 "가져오기"를 나눈다 — 선택은 검증된 pickTrack 이 playerResponse
+ * 로 끝내고, 이 함수는 그 트랙에 해당하는 런타임 URL 만 찾아 준다.
+ *
+ * ★ 틀리면 증상이 "자막이 안 나온다"가 아니라 "다른 트랙의 자막이 나온다"다.
+ *   채팅 로그를 자막으로 띄웠던 사고와 같은 종류다 (I27).
+ */
+const rt = (o) => ({ hasPot: true, ...o });
+
+// [실측 VBMUMuZBxw0, Chrome 151] 런타임과 정적은 순서가 역순이고 vssId 는 같다.
+const RUNTIME_VBMU = [
+  rt({ vssId: ".en-US._5Vp3ULVrJE", languageCode: "en-US", kind: "", url: "u-chat" }),
+  rt({ vssId: "a.en", languageCode: "en", kind: "asr", url: "u-asr" }),
+];
+
+test("★ vssId 로 대조한다 — 인덱스로 하면 순서가 달라 다른 트랙이 온다", () => {
+  const y = withPrefer("ko");
+  // 정적 목록은 [a.en, 채팅] 순이라 pickTrack 이 고른 것은 배열 0번이다.
+  // 런타임 목록에서 0번은 채팅이다 — 인덱스로 짰다면 채팅 URL 을 가져왔을 것이다.
+  const asr = { vssId: "a.en", languageCode: "en", kind: "asr", baseUrl: "b" };
+  assert.equal(y.runtimeUrlFor(asr, RUNTIME_VBMU), "u-asr");
+});
+
+test("★ 채팅 트랙을 고른 경우에도 자기 URL 을 받는다", () => {
+  const y = withPrefer("ko");
+  const chat = { vssId: ".en-US._5Vp3ULVrJE", languageCode: "en-US", trackName: "Twitch Chat", baseUrl: "b" };
+  assert.equal(y.runtimeUrlFor(chat, RUNTIME_VBMU), "u-chat");
+});
+
+test("★ pot 없는 런타임 트랙은 후보가 아니다 (I30)", () => {
+  // pot 없는 URL 은 어차피 빈 본문이다. 쓰면 via 만 "runtime" 이라 거짓이 된다.
+  const y = withPrefer("ko");
+  const noPot = RUNTIME_VBMU.map((t) => ({ ...t, hasPot: false }));
+  assert.equal(y.runtimeUrlFor({ vssId: "a.en", languageCode: "en", kind: "asr" }, noPot), null);
+});
+
+test("★ 대조가 애매하면 null — 강등이 틀린 URL 보다 낫다 (I27)", () => {
+  const y = withPrefer("ko");
+  const t = { vssId: "a.en", languageCode: "en", kind: "asr" };
+  assert.equal(y.runtimeUrlFor(t, []), null, "후보 0개");
+  const dup = [rt({ vssId: "a.en", languageCode: "en", kind: "asr", url: "x" }),
+               rt({ vssId: "a.en", languageCode: "en", kind: "asr", url: "y" })];
+  assert.equal(y.runtimeUrlFor(t, dup), null, "같은 vssId 가 둘이면 우리가 모르는 상황이다");
+});
+
+test("vssId 가 없으면 언어와 ASR 여부로 내려간다", () => {
+  const y = withPrefer("ko");
+  const pool = [rt({ languageCode: "en", kind: "asr", url: "u-asr" }),
+                rt({ languageCode: "en", kind: "", url: "u-manual" })];
+  assert.equal(y.runtimeUrlFor({ languageCode: "en", kind: "asr" }, pool), "u-asr");
+  assert.equal(y.runtimeUrlFor({ languageCode: "en", vssId: ".en" }, pool), "u-manual");
+});
+
+test("지역 변종(en-US)도 같은 언어로 본다", () => {
+  const y = withPrefer("ko");
+  const pool = [rt({ languageCode: "en-US", kind: "", url: "u" })];
+  assert.equal(y.runtimeUrlFor({ languageCode: "en", vssId: ".en" }, pool), "u");
+});
+
+test("입력이 망가져도 죽지 않는다", () => {
+  const y = withPrefer("ko");
+  assert.equal(y.runtimeUrlFor(null, RUNTIME_VBMU), null);
+  assert.equal(y.runtimeUrlFor({ vssId: "a.en" }, null), null);
+  assert.equal(y.runtimeUrlFor({ vssId: "a.en" }, [null, {}]), null);
 });
