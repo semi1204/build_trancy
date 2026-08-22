@@ -26,16 +26,94 @@
  *  W8  LLM_MODEL 은 GPT 계열이어야 한다. Claude 계열은 이 프록시가 Claude Code
  *      세션으로 라우팅해 시스템 프롬프트를 무시하므로 쓸 수 없다.        [실측]
  *  W9  응답 지연은 출력 토큰 수에 정비례한다. 프롬프트가 더 뱉게 만드는 모든 변경은
- *      곧바로 지연이다.                    [실측: 4000토큰 73초 / 672토큰 13.7초]
+ *      곧바로 지연이다.  지연 ≈ 0.019 × 출력토큰 (약 53 tok/s).
+ *                                  [실측: 749토큰 14.6초 / 3955토큰 72.7초]
+ *
+ * ── 거리 기반 2단 이후 추가된 것 ────────────────────────────────────
+ *  W10 reasoning: "none" 은 reasoning 을 끄지 못한다. 껐는지 여부는 설정이 아니라
+ *      usage.completion_tokens_details.reasoning_tokens 로만 판단할 수 있다.
+ *      [실측: effort none 인데 N=12 에서 reasoning 1002토큰 발생]
+ *  W11 reasoning 토큰은 요청 크기에 비례하지 않는다. 사실상 요청당 상수라, 청크를
+ *      1/4 로 줄여도 지연은 1.76배밖에 안 줄어든다.
+ *      [실측: N=12 reasoning 1553 / N=48 reasoning 2090 — 4배 조각에 1.3배]
+ *  W12 reasoning 을 만드는 것은 요청 크기가 아니라 프롬프트의 과제 복잡도다.
+ *      병합+분할+번역 3중 과제가 원인이고, 번역만 시키면 0 이 된다.
+ *      [실측: 같은 12조각 — 병합프롬프트 reasoning 410 / 번역만 148 /
+ *             terra + 번역만 0 (2.7초)]
+ *  W13 캐시 키는 mode 를 반드시 포함한다. 지문은 조각 텍스트로만 만들어지므로
+ *      같은 조각의 fast 요청과 full 요청이 같은 키가 된다. 그러면 먼저 저장된
+ *      fast 결과(문자열 배열)가 full 요청에 나가고, 확장은 lines 를 기대하다
+ *      빈 응답으로 처리한다 — 그 구간은 영영 정확한 번역을 못 받는다.
+ *  W14 fast 결과는 절대 정렬하지 않는다. t 에는 시간이 없어 정렬 기준이 없고,
+ *      배치 순서가 곧 조각 순서다. lines 용 sort 를 그대로 태우면 undefined
+ *      비교로 순서가 뒤섞여 번역 전체가 어긋난다.
+ *  W15 fast 는 빈 조각을 허용하지 않는다. clean 필터가 하나라도 걸러내면 응답
+ *      길이가 요청 길이와 달라져 인덱스가 밀린다. 조용히 밀리느니 거절한다.
+ *  W16 fast 요청에는 CTX 줄을 붙이지 않는다. 번호 없는 CTX 가 섞이면 모델이
+ *      그것까지 세어 t 의 길이가 밀린다 — W15 와 같은 실패로 이어진다.
+ *  W17 LLM_MODEL 은 자막·단어팝업·페이지번역이 공유한다. 자막만 바꾸려면 자막
+ *      전용 상수를 따로 두어야 한다. 지금 값을 바꾸면 세 기능이 함께 바뀐다.
  * ──────────────────────────────────────────────────────────────────── */
+
+/**
+ * @typedef {object} Usage  상류 LLM 응답의 usage 를 그대로 통과시킨 것.
+ *   우리가 만드는 형태가 아니라 상류가 주는 형태다 — 래핑하거나 이름을 바꾸지 않는다.
+ * @property {number} [prompt_tokens]
+ * @property {number} [completion_tokens]  가시 출력 + reasoning 의 합계
+ * @property {object} [completion_tokens_details]
+ * @property {number} [completion_tokens_details.reasoning_tokens]
+ *
+ * W9 의 "출력 토큰"이 무엇으로 이루어졌는지를 가르는 값이 reasoning_tokens 다.
+ * Phase 0 산술로는 48조각 4000토큰 중 약 2250(56%)이 reasoning 으로 추정되나
+ * 확인된 적이 없다. 청크 크기를 정하려면 reasoning 이 요청 크기에 비례하는지
+ * 요청당 고정인지를 알아야 하고, 그 답이 이 필드에만 들어 있다.
+ *
+ * Phase 4 실측으로 확인됨: usage 는 전달되고 reasoning_tokens 도 채워진다.
+ * 같은 측정에서 나온 것 — reasoning: "none" 은 reasoning 을 끄지 못한다(N=12 에서
+ * 1002토큰 발생). 끄고 켜짐은 설정이 아니라 이 필드로만 판단할 수 있다.
+ */
+
+/**
+ * @typedef {"fast"|"full"} Mode  자막 번역 요청의 등급. 확장이 재생 위치와의
+ *   거리로 정해 보낸다.
+ *   fast = 조각별 1:1 번역. 병합·분할·원문 재출력 없음. 응답은 문자열 배열.
+ *          [실측: terra + effort none, 8조각, 2.7초, reasoning 0토큰]
+ *   full = 지금의 병합·분할 번역. 응답은 줄 객체 배열.
+ *          [실측: terra, 12조각, 9.7초]
+ *
+ * 등급이 둘로 갈리는 근거는 시청 순서다. 재생 중인 구간은 지금 필요하므로 속도가,
+ * 앞으로 볼 구간은 몇 분 뒤에나 닿으므로 정확도가 이긴다.
+ */
+
+/**
+ * @typedef {object} SubtitleResponse  /api/subtitle 의 응답. mode 에 따라 갈린다.
+ * @property {string[]}  [t]        mode=fast 일 때만. 요청한 segments 와 같은 길이·
+ *                                  같은 순서의 번역 문자열. 원문·타임스탬프는 넣지
+ *                                  않는다 — 확장이 이미 갖고 있고, 출력 토큰이 곧
+ *                                  지연이다(W9).
+ * @property {object[]}  [lines]    mode=full 일 때만. {start, end, orig, trans}.
+ * @property {boolean}   cached
+ * @property {boolean}   [degraded]
+ * @property {Usage}     [usage]
+ *
+ * t 와 lines 는 절대 동시에 존재하지 않는다. 둘 다 실으면 확장이 어느 쪽을 믿을지
+ * 정할 수 없고, 조각 경계와 문장 경계가 섞여 같은 시각을 두 줄이 덮게 된다.
+ */
 
 // 불변식 W8: GPT 계열만. Claude 계열로 바꾸면 프록시가 Claude Code 세션으로 라우팅해
 //   시스템 프롬프트를 무시한다 (Phase 4 실측: 1.5초 만에 "I'm Claude Code" 응답).
-const LLM_MODEL = "gpt-5.6-luna";
+// Phase 4 모델 스윕(12조각, 커버리지 전원 통과): terra 9.7s / 5.4 13.0s /
+//   codex-spark 13.1s(reasoning 1만↑) / 5.5 23.2s / luna 60s↑ / 5.4-mini 86.0s.
+//   W17: 이 상수는 자막·단어팝업·페이지번역이 공유한다. 세 기능이 함께 바뀐다(승인됨).
+const LLM_MODEL = "gpt-5.6-terra";
 const DEFAULT_LLM_URL = "https://api.openai.com/v1/chat/completions";
 // Phase 4 실측으로 조정 폐기: low=73/77s, none=70/69s, minimal=49/100s(분산만 커짐).
 //   효과 4% 라 품질 위험을 감수할 이유가 없다. 지연은 REASONING 이 아니라 출력 토큰이 만든다(W9).
-const REASONING = "low";     // 번역은 추론이 거의 필요 없음. none 도 가능
+// 재판정 결과(W10): "none" 은 reasoning 을 끄지 못한다 — effort none 인데 N=12 에서
+//   reasoning 1002토큰이 나왔다. 끄는 것은 설정이 아니라 프롬프트 단순화다(W12).
+//   full 은 병합·분할이 실제로 추론을 필요로 하므로 low 를 유지한다. fast 는 아래
+//   translateBatch 에서 none 을 쓰고, 실측상 그 조합에서만 reasoning 이 0 이 된다.
+const REASONING = "low";     // full 등급 전용. fast 는 none (translateBatch 참조)
 // TODO(phase6): 이 값을 Phase 4 측정 0 에서 나온 LLM 왕복 실측치의 3~4배로 다시 정한다.
 //   90000 은 측정 전에 임의로 넣은 값이라 근거가 없다.
 const LLM_TIMEOUT_MS = 90000;  // LLM 호출 1회의 상한. 멈춘 업스트림이 슬롯을 영구 점유하지 못하게 한다
@@ -46,6 +124,19 @@ const BATCH = 200;           // 컨텍스트 1.05M 이라 넉넉히. 문맥이 �
 const CONCURRENCY = 3;
 const MAX_SEGMENTS = 8000;
 const MAX_CARDS = 2000;
+
+/* fast 등급. 병합·분할·원문 재출력을 전부 뺀 조각별 1:1 번역만 시킨다.
+ * W12: reasoning 을 만드는 것은 요청 크기가 아니라 과제 복잡도다. 병합+분할+번역
+ *   3중 과제를 번역 하나로 줄이면 reasoning 이 0 이 된다.
+ *   [실측: 같은 12조각 — 이 프롬프트 reasoning 148 / SYSTEM 410, terra 조합에서 0]
+ * W16: 이 프롬프트에는 CTX 줄을 붙이지 않는다. 번호 없는 줄이 섞이면 모델이
+ *   그것까지 세어 t 의 길이가 밀린다. 개수 일치가 이 등급의 유일한 계약이다(W15). */
+const FAST_SYSTEM = (target) => `Translate each numbered subtitle fragment into natural ${target}.
+Keep the same numbering and the same number of items. Do not merge, split,
+reorder, or explain. A fragment may be cut mid-sentence — translate it as the
+partial phrase it is, using the surrounding fragments to resolve meaning.
+Output ONLY: {"t":["...","..."]} — one translation per input, same order, same count.
+No markdown fences, no commentary.`;
 
 const SYSTEM = (target) => `You merge broken YouTube caption fragments into natural subtitle lines and translate them for a language learner.
 
@@ -99,12 +190,28 @@ async function sha1(str) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ── 번역 ─────────────────────────────────────────────────────────────
-async function translateBatch(env, batch, target, ctxB = [], ctxA = []) {
-  const payload =
-    ctxB.map((t) => `CTX-: ${t}`).join("\n") +
-    (ctxB.length ? "\n" : "") +
-    batch.map((s, i) => `${i}: ${s.text}`).join("\n") +
-    (ctxA.length ? "\n" + ctxA.map((t) => `CTX+: ${t}`).join("\n") : "");
+/**
+ * 목표 계약 (Phase 6 에서 구현).
+ * @param {Mode} mode  fast 면 FAST_SYSTEM 으로 조각별 번역, full 이면 지금의 SYSTEM.
+ *   프롬프트와 응답 파싱만 갈린다. fetch·재시도·타임아웃 경로는 공유한다 — 등급별로
+ *   함수를 나누면 그 40줄이 복제되고 재시도 정책이 두 벌로 갈라진다.
+ * @returns {Promise<{lines?: object[], t?: string[], degraded?: boolean, usage?: Usage}>}
+ *   mode=full 이면 lines, mode=fast 면 t. 둘은 동시에 반환하지 않는다.
+ *   usage 는 상류 응답의 것을 그대로 통과시킨다. 상류가 안 주면 필드 자체가 없다
+ *   (0 으로 채우지 않는다 — "측정 안 됨"과 "0 토큰"은 다른 사실이다).
+ */
+async function translateBatch(env, batch, target, ctxB = [], ctxA = [], mode = "full") {
+  const fast = mode === "fast";
+  const numbered = batch.map((s, i) => `${i}: ${s.text}`).join("\n");
+  // W16: fast 에는 CTX 를 붙이지 않는다. 번호 없는 줄이 개수를 밀리게 한다.
+  const payload = fast
+    ? numbered
+    : ctxB.map((t) => `CTX-: ${t}`).join("\n") +
+      (ctxB.length ? "\n" : "") +
+      numbered +
+      (ctxA.length ? "\n" + ctxA.map((t) => `CTX+: ${t}`).join("\n") : "");
+
+  let lastUsage;
 
   // TODO(phase6): 아래 fetch 에 AbortController + LLM_TIMEOUT_MS 를 건다. 지금은 타임아웃이
   //   없어 업스트림이 멈추면 요청이 무기한 매달리고, 확장 쪽 runner 도 함께 묶인다 (불변식 10).
@@ -119,10 +226,10 @@ async function translateBatch(env, batch, target, ctxB = [], ctxA = []) {
         },
         body: JSON.stringify({
           model: LLM_MODEL,
-          reasoning: { effort: REASONING },
+          reasoning: { effort: fast ? "none" : REASONING },
           response_format: { type: "json_object" },
           messages: [
-            { role: "system", content: SYSTEM(target) },
+            { role: "system", content: fast ? FAST_SYSTEM(target) : SYSTEM(target) },
             { role: "user", content: payload },
           ],
         }),
@@ -135,7 +242,24 @@ async function translateBatch(env, batch, target, ctxB = [], ctxA = []) {
       if (!res.ok) throw new Error(`llm ${res.status}`);
 
       const data = await res.json();
+      // reasoning_tokens 는 중첩이다. 평평한 자리를 읽으면 조용히 undefined 가 되어
+      // 측정이 되는 것처럼 보이면서 전부 0 이 된다 (Usage typedef 참조).
+      if (data.usage) lastUsage = data.usage;
       const parsed = JSON.parse(data.choices[0].message.content);
+
+      // W15/I18: fast 의 검사는 길이 하나뿐이다. 밀리면 엉뚱한 시각에 엉뚱한 번역이
+      // 붙는데, 그건 번역이 없는 것보다 나쁘고 화면만 봐서는 알아챌 수 없다.
+      if (fast) {
+        const t = parsed.t;
+        if (!Array.isArray(t) || t.length !== batch.length) {
+          throw new Error(`fast 길이 불일치 ${t?.length}/${batch.length}`);
+        }
+        return {
+          t: t.map((x) => String(x ?? "").trim()),
+          ...(lastUsage ? { usage: lastUsage } : {}),
+        };
+      }
+
       const out = [];
 
       for (const ln of parsed.lines || []) {
@@ -170,7 +294,12 @@ async function translateBatch(env, batch, target, ctxB = [], ctxA = []) {
         }
         i = j + 1;
       }
-      if (out.length) return { lines: out.map(({ s, e, ...rest }) => rest) };
+      if (out.length) {
+        return {
+          lines: out.map(({ s, e, ...rest }) => rest),
+          ...(lastUsage ? { usage: lastUsage } : {}),
+        };
+      }
     } catch {
       if (attempt === 2) break;
       await sleep(500 * 2 ** attempt);
@@ -178,9 +307,17 @@ async function translateBatch(env, batch, target, ctxB = [], ctxA = []) {
   }
 
   // 포기 - 원문만 살려 진행. 전체가 날아가지 않게.
+  // fast 는 원문을 돌려줄 자리가 없으므로 길이만 맞춘 빈 문자열을 준다. 확장은 빈
+  // 문자열을 "번역 없음"으로 보고 등급을 올리지 않아 원문이 그대로 남는다 (I5).
+  // usage 는 있으면 싣는다 — 응답은 했는데 파싱만 실패한 시도의 토큰도 실제 소모다.
+  // 아무 응답도 못 받았으면 필드를 생략한다(0 으로 채우면 "측정 안 됨"과 뭉개진다).
+  if (fast) {
+    return { t: batch.map(() => ""), degraded: true, ...(lastUsage ? { usage: lastUsage } : {}) };
+  }
   return {
     lines: batch.map((s) => ({ start: s.start, end: s.end, orig: s.text, trans: "" })),
     degraded: true,
+    ...(lastUsage ? { usage: lastUsage } : {}),
   };
 }
 
@@ -343,13 +480,25 @@ async function enforceShortLines(env, lines) {
   return out;
 }
 
-async function translateAll(env, segments, target, ctxB = [], ctxA = []) {
+/**
+ * 목표 계약 (Phase 6 에서 구현).
+ * @param {Mode} mode  translateBatch 로 그대로 넘긴다.
+ * @returns {Promise<{lines?: object[], t?: string[], degraded: number, usage?: Usage}>}
+ *   usage 는 배치별 값의 합이다. W3 대로 확장이 BATCH 보다 작게 보내는 한
+ *   배치는 항상 1개라 합산은 그대로 통과와 같다. 배치가 여럿일 때 합이 옳은
+ *   이유는 이 값이 "요청 하나가 쓴 토큰"을 뜻하기 때문이다.
+ *   ★ mode=fast 에서 배치가 2개 이상이면 t 를 순서대로 이어붙여야 한다. lines 처럼
+ *     start 로 정렬할 수 없다 — t 에는 시간이 없고 순서가 곧 의미다.
+ */
+async function translateAll(env, segments, target, ctxB = [], ctxA = [], mode = "full") {
   const batches = [];
   for (let i = 0; i < segments.length; i += BATCH) {
     batches.push(segments.slice(i, i + BATCH));
   }
 
+  const fast = mode === "fast";
   const results = new Array(batches.length);
+  const usages = [];
   let cursor = 0, degraded = 0;
 
   const runner = async () => {
@@ -359,10 +508,12 @@ async function translateAll(env, segments, target, ctxB = [], ctxA = []) {
       const r = await translateBatch(
         env, batches[my], target,
         my === 0 ? ctxB : [],
-        my === batches.length - 1 ? ctxA : []
+        my === batches.length - 1 ? ctxA : [],
+        mode
       );
+      if (r.usage) usages.push(r.usage);      // 합이 "이 요청이 쓴 토큰"이다
       if (r.degraded) degraded++;
-      results[my] = r.lines;
+      results[my] = fast ? r.t : r.lines;
     }
   };
 
@@ -370,14 +521,40 @@ async function translateAll(env, segments, target, ctxB = [], ctxA = []) {
     Array.from({ length: Math.min(CONCURRENCY, batches.length) }, runner)
   );
 
-  return { lines: results.flat().sort((a, b) => a.start - b.start), degraded };
+  const usage = usages.length
+    ? {
+        prompt_tokens: usages.reduce((n, u) => n + (u.prompt_tokens || 0), 0),
+        completion_tokens: usages.reduce((n, u) => n + (u.completion_tokens || 0), 0),
+        completion_tokens_details: {
+          reasoning_tokens: usages.reduce(
+            (n, u) => n + (u.completion_tokens_details?.reasoning_tokens || 0), 0),
+        },
+      }
+    : undefined;
+  // W14: fast 는 이어붙이기만 한다. t 에는 시간이 없어 정렬 기준이 없고 배치 순서가
+  //   곧 조각 순서다. lines 용 sort 를 태우면 undefined 비교로 순서가 뒤섞인다.
+  const merged = fast
+    ? { t: results.flat() }
+    : { lines: results.flat().sort((a, b) => a.start - b.start) };
+  return { ...merged, degraded, ...(usage ? { usage } : {}) };
 }
 
+/**
+ * 목표 계약 (Phase 6 에서 구현).
+ * 요청 본문에 mode 가 추가된다: { videoId, lang, target, segments, ctxBefore, ctxAfter, mode }
+ *   mode 가 없으면 "full" 로 본다 — 옛 확장이 붙어도 지금 동작이 유지된다.
+ * 응답은 SubtitleResponse. mode=fast 면 t, full 이면 lines. usage 도 추가된다.
+ *   캐시 히트에는 usage 가 없다 — LLM 을 안 불렀으므로 0 이 아니라 "해당 없음"이다.
+ * ★ 캐시 키에 mode 가 반드시 들어가야 한다. 안 넣으면 같은 지문에 fast 결과가
+ *   저장되어 full 요청이 조각별 번역을 돌려받는다 (W13).
+ */
 async function handleSubtitle(request, env, ctx) {
   let body;
   try { body = await request.json(); } catch { return json({ error: "invalid json" }, 400); }
 
   const { videoId, lang = "", target = "Korean", segments, ctxBefore, ctxAfter } = body;
+  // 값이 없거나 모르는 값이면 full. 옛 확장이 붙어도 지금 동작이 유지된다.
+  const mode = body.mode === "fast" ? "fast" : "full";
   if (!videoId || !Array.isArray(segments) || !segments.length) {
     return json({ error: "videoId 와 segments 가 필요합니다" }, 400);
   }
@@ -391,13 +568,18 @@ async function handleSubtitle(request, env, ctx) {
   const fingerprint = await sha1(
     [...ctxB, "\u0002", ...segments.map((s) => s.text), "\u0002", ...ctxA].join("\u0001")
   );
-  const key = `sub:v6:${videoId}:${lang}:${target}:${fingerprint.slice(0, 12)}`;  // v6: 기계 분할, 85자 (W2)
+  // v7 (W2): LLM_MODEL 을 luna → terra 로 바꿨다. 지문은 조각 텍스트로만 만들어지므로
+  //   버전을 안 올리면 같은 키에 옛 모델의 번역이 남아 계속 서빙된다.
+  // mode (W13): 안 넣으면 같은 조각의 fast 요청과 full 요청이 같은 키가 된다. 먼저
+  //   저장된 fast 결과(문자열 배열)가 full 요청에 나가고, 확장은 lines 를 기대하다
+  //   빈 응답으로 처리한다 — 그 구간은 영영 정확한 번역을 못 받는다.
+  const key = `sub:v7:${mode}:${videoId}:${lang}:${target}:${fingerprint.slice(0, 12)}`;
 
   // 불변식 W2: 위 키의 버전(sub:vN)은 출력 줄 형태가 바뀔 때마다 올려야 한다.
   //   Phase 4 실측 — 캐시 히트는 0.0초(미스 대비 약 2만배)라 이 경로가 사실상 전부다.
   //   버전을 안 올리면 옛 형태가 계속 나가고 변경이 없던 일이 된다.
   const hit = env.SUBS && (await env.SUBS.get(key, "json"));
-  if (hit) return json({ lines: hit, cached: true });
+  if (hit) return json(mode === "fast" ? { t: hit, cached: true } : { lines: hit, cached: true });
 
   if (!env.OPENAI_API_KEY) return json({ error: "OPENAI_API_KEY 미설정" }, 500);
 
@@ -409,14 +591,30 @@ async function handleSubtitle(request, env, ctx) {
       text: s.text.trim().slice(0, 400),
     }));
 
-  let { lines, degraded } = await translateAll(env, clean, target, ctxB, ctxA);
+  // W15: clean 이 하나라도 걸러내면 fast 응답 길이가 요청 길이와 달라져 인덱스가
+  //   밀린다. 조용히 밀리느니 거절한다.
+  if (mode === "fast" && clean.length !== segments.length) {
+    return json({ error: "fast 는 빈 조각을 허용하지 않습니다" }, 400);
+  }
+
+  let { lines, t, degraded, usage } = await translateAll(env, clean, target, ctxB, ctxA, mode);
+
+  // fast 결과는 문자열 배열이라 enforceShortLines 에 넣으면 l.orig 가 없어 터진다.
+  // 조각별 번역은 이미 짧아 분할할 이유도 없다.
+  if (mode === "fast") {
+    if (!t?.length) return json({ error: "번역 실패" }, 502);
+    if (env.SUBS && !degraded) ctx.waitUntil(env.SUBS.put(key, JSON.stringify(t)));
+    return json({ t, cached: false, degraded: degraded > 0, ...(usage ? { usage } : {}) });
+  }
+
   lines = await enforceShortLines(env, lines);   // 캐시에도 분할된 형태로 저장된다
   if (!lines.length) return json({ error: "번역 실패" }, 502);
 
   // 일부라도 실패했으면 캐시하지 않는다 (다음에 온전히 재시도)
   if (env.SUBS && !degraded) ctx.waitUntil(env.SUBS.put(key, JSON.stringify(lines)));
 
-  return json({ lines, cached: false, degraded: degraded > 0 });
+  // 캐시 히트 return 에는 usage 가 없다 — LLM 을 안 불렀으므로 0 이 아니라 "해당 없음"이다.
+  return json({ lines, cached: false, degraded: degraded > 0, ...(usage ? { usage } : {}) });
 }
 
 // ── 전사 (자막 트랙 없는 영상 → Groq Whisper) ────────────────────────

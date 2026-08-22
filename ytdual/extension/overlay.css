@@ -1,3 +1,12 @@
+/* 우리 자막이 떠 있는 동안 유튜브 native 자막을 숨긴다. 안 숨기면 유튜브 자막과
+   우리 오버레이가 함께 보인다. 클래스는 content.js 가 seedRawLines 직후에 붙이고
+   stop() 에서 뗀다 — 원문이 뜨기 전에 숨기면 그 사이 화면에 자막이 하나도 없다.
+   I14: 유튜브 요소를 직접 고치지 않고 클래스 하나로만 제어한다. */
+html.ytdual-on .ytp-caption-window-container,
+html.ytdual-on .caption-window {
+  display: none !important;
+}
+
 #ytdual-box {
   position: fixed;
   z-index: 2147483000;
