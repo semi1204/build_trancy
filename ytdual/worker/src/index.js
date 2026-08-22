@@ -102,8 +102,12 @@
 
 // 불변식 W8: GPT 계열만. Claude 계열로 바꾸면 프록시가 Claude Code 세션으로 라우팅해
 //   시스템 프롬프트를 무시한다 (Phase 4 실측: 1.5초 만에 "I'm Claude Code" 응답).
-// Phase 4 모델 스윕(12조각, 커버리지 전원 통과): terra 9.7s / 5.4 13.0s /
+// Phase 4 모델 스윕(12조각, 합성 텍스트): terra 9.7s / 5.4 13.0s /
 //   codex-spark 13.1s(reasoning 1만↑) / 5.5 23.2s / luna 60s↑ / 5.4-mini 86.0s.
+//   ★ 위 스윕은 합성 텍스트(test/worker.test.js 의 반복 문장)로 쟀다. 실제 자막으로
+//     다시 재니 terra 는 9.7s 가 아니라 full N=12 에서 수동 22.5s / 자동 18.5s 였다.
+//     모델 간 순위는 유효하되 절대값은 2배 이상 낙관적이다.
+//     [scripts/bench-translation.mjs, 실제 자막 4개 fixture, 60요청]
 //   W17: 이 상수는 자막·단어팝업·페이지번역이 공유한다. 세 기능이 함께 바뀐다(승인됨).
 const LLM_MODEL = "gpt-5.6-terra";
 const DEFAULT_LLM_URL = "https://api.openai.com/v1/chat/completions";
@@ -112,11 +116,25 @@ const DEFAULT_LLM_URL = "https://api.openai.com/v1/chat/completions";
 // 재판정 결과(W10): "none" 은 reasoning 을 끄지 못한다 — effort none 인데 N=12 에서
 //   reasoning 1002토큰이 나왔다. 끄는 것은 설정이 아니라 프롬프트 단순화다(W12).
 //   full 은 병합·분할이 실제로 추론을 필요로 하므로 low 를 유지한다. fast 는 아래
-//   translateBatch 에서 none 을 쓰고, 실측상 그 조합에서만 reasoning 이 0 이 된다.
+//   translateBatch 에서 none 을 쓴다.
+//   ★ 정정: "fast 조합에서만 reasoning 이 0" 은 수동 자막에서만 참이다. 자동생성
+//     자막(구두점 0, 문장 중간 절단)은 같은 프롬프트·같은 effort:none 에서도
+//     reasoning 중앙값 134 가 나왔다. 조각이 어려우면 프롬프트 단순화로도 못 끈다.
+//     [실측 fast N=8: 수동 reasoning 0 / 자동 134. full 은 수동 391 / 자동 620]
 const REASONING = "low";     // full 등급 전용. fast 는 none (translateBatch 참조)
-// TODO(phase6): 이 값을 Phase 4 측정 0 에서 나온 LLM 왕복 실측치의 3~4배로 다시 정한다.
-//   90000 은 측정 전에 임의로 넣은 값이라 근거가 없다.
-const LLM_TIMEOUT_MS = 90000;  // LLM 호출 1회의 상한. 멈춘 업스트림이 슬롯을 영구 점유하지 못하게 한다
+/* 타임아웃·재시도는 등급별로 다르다. fast 는 미리보기이기 때문이다 — 늦게 도착한
+ * 미리보기는 가치가 0 이다. 그 사이 full 이 이미 왔거나 곧 온다.
+ *   [실측 fast N=8: 중앙 5.7초 / p90 11.5초. degraded 1건(12건 중)은 3회를 다 쓰고
+ *    36.9초 만에 빈 문자열을 냈다 — runner 슬롯 하나를 37초 묶고 결과는 쓸모없었다.
+ *    그럴 바엔 일찍 포기하고 full 에 맡기는 편이 낫다]
+ *   [실측 full: 중앙 16~22초 / 최대 54.9초. 재시도 없이 24/24 성공]
+ * 값은 각 등급 상위 지연의 3배로 잡았다. 너무 짧으면 정상 요청을 끊고, 너무 길면
+ * 멈춘 업스트림이 슬롯을 오래 점유한다. */
+const LLM_TIMEOUT_MS = 165000;   // full 1회 상한. 실측 최대 54.9초의 3배
+const FAST_TIMEOUT_MS = 36000;   // fast 1회 상한. 실측 p90 11.5초의 3배
+const LLM_ATTEMPTS = 3;          // full: 실패하면 그 구간이 원문으로 남으므로 끈질기게
+const FAST_ATTEMPTS = 2;         // fast: 안 되면 full 이 처리한다
+// I12 (content.js): 확장 타임아웃 > 165×3 + 백오프 1.5초 ≈ 497초
 // 불변식 W3: 확장이 BATCH 보다 작은 요청만 보내는 한 batches.length 는 항상 1 이고,
 //   아래 CONCURRENCY runner 풀은 단일 순차 호출로 축퇴한다 — 즉 죽은 코드다.
 //   실제 동시성 손잡이는 확장 쪽 runner 개수뿐이다 (I13: 8개 이하).
@@ -200,6 +218,39 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  *   usage 는 상류 응답의 것을 그대로 통과시킨다. 상류가 안 주면 필드 자체가 없다
  *   (0 으로 채우지 않는다 — "측정 안 됨"과 "0 토큰"은 다른 사실이다).
  */
+/** 모델이 빠뜨린 조각을 원문 그대로 끼워 넣는다. out 을 제자리에서 고친다.
+ *
+ *  불변식 W20: 응답은 batch 의 모든 조각을 덮어야 한다. SYSTEM 프롬프트가
+ *    "cover every fragment exactly once" 를 요구하지만 모델은 가끔 어긴다 —
+ *    특히 "00:43 DEREK" 같은 자막 부산물을 노이즈로 보고 버린다.
+ *    [실측: 24요청 중 1건. gIwvFMiJNVU 의 마지막 조각이 빠져 1.00초가 비었다]
+ *
+ *  왜 그냥 두면 안 되나 — mergeTranslated 는 청크 구간 [t0,t1] 의 raw 줄을 지우고
+ *    응답으로 갈아끼운다. 응답이 그 구간을 다 안 덮으면 지워진 자리가 그대로
+ *    빈 시각이 된다 (I5 위반: 화면에 아무것도 없는 순간).
+ *
+ *  번역 없이 원문만 넣는 이유 — 없는 번역을 지어낼 수는 없다. 원문이라도 보이는
+ *    편이 아무것도 없는 것보다 낫다. 화면이 비는 것은 언제나 최악이다. */
+function fillUncovered(batch, out) {
+  const covered = new Uint8Array(batch.length);
+  for (const l of out) for (let i = l.s; i <= l.e; i++) covered[i] = 1;
+  let added = false;
+  for (let i = 0; i < batch.length; i++) {
+    if (covered[i]) continue;
+    out.push({
+      s: i, e: i,
+      start: batch[i].start, end: batch[i].end,
+      orig: batch[i].text, trans: "",
+    });
+    added = true;
+  }
+  // 아래 글자수 비례 분할이 "같은 (s,e) 가 연속으로 붙어 있다"를 전제하므로
+  // 끼워 넣었으면 인덱스 순서를 되돌려야 한다. sort 는 안정 정렬이라 같은 s 의
+  // 원래 순서(모델이 낸 순서)는 보존된다.
+  if (added) out.sort((a, b) => a.s - b.s || a.e - b.e);
+  return out;
+}
+
 async function translateBatch(env, batch, target, ctxB = [], ctxA = [], mode = "full") {
   const fast = mode === "fast";
   const numbered = batch.map((s, i) => `${i}: ${s.text}`).join("\n");
@@ -213,13 +264,17 @@ async function translateBatch(env, batch, target, ctxB = [], ctxA = [], mode = "
 
   let lastUsage;
 
-  // TODO(phase6): 아래 fetch 에 AbortController + LLM_TIMEOUT_MS 를 건다. 지금은 타임아웃이
-  //   없어 업스트림이 멈추면 요청이 무기한 매달리고, 확장 쪽 runner 도 함께 묶인다 (불변식 10).
-  //   타임아웃 만료는 기존 catch 로 떨어져 재시도 경로를 그대로 탄다.
-  for (let attempt = 0; attempt < 3; attempt++) {
+  // 불변식 10: 이 fetch 는 유한 타임아웃을 가진다. 없으면 멈춘 업스트림 하나가
+  //   무기한 매달리고, 확장 쪽 runner 슬롯도 함께 묶인다.
+  //   타임아웃 만료는 아래 catch 로 떨어져 기존 재시도 경로를 그대로 탄다.
+  const attempts = fast ? FAST_ATTEMPTS : LLM_ATTEMPTS;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), fast ? FAST_TIMEOUT_MS : LLM_TIMEOUT_MS);
     try {
       const res = await fetch(env.LLM_URL || DEFAULT_LLM_URL, {
         method: "POST",
+        signal: ctl.signal,
         headers: {
           Authorization: `Bearer ${env.OPENAI_API_KEY}`,
           "Content-Type": "application/json",
@@ -276,6 +331,7 @@ async function translateBatch(env, batch, target, ctxB = [], ctxA = [], mode = "
           trans: String(ln.t ?? "").trim(),
         });
       }
+      fillUncovered(batch, out);
       // 같은 fragment 구간을 여러 줄로 쪼갠 경우 시간도 글자수 비례로 나눈다
       // (안 나누면 start 가 같아져 앞줄이 표시되지 않는다)
       let i = 0;
@@ -301,8 +357,12 @@ async function translateBatch(env, batch, target, ctxB = [], ctxA = [], mode = "
         };
       }
     } catch {
-      if (attempt === 2) break;
+      if (attempt === attempts - 1) break;
       await sleep(500 * 2 ** attempt);
+    } finally {
+      // finally 여야 한다 — 위 429/5xx 분기가 continue 로 빠져나가므로
+      // try 끝에서 지우면 그 경로에서 타이머가 남는다.
+      clearTimeout(timer);
     }
   }
 
@@ -377,22 +437,102 @@ function packToK(pieces, k) {
   return groups;
 }
 
-function splitLine(line) {
-  if (line.orig.length <= MAX_LINE_CHARS) return [line];
-  const oParts = packByCap(clausePieces(line.orig));
-  const n = oParts.length;
-  if (n < 2) return [line];
-  const tParts = line.trans ? packToK(clausePieces(line.trans), n) : [];
+/** 번역을 정확히 k 조각으로 나눈다. 모든 조각은 비어 있지 않다.
+ *
+ *  불변식 W19: 번역이 있는 줄을 분할했는데 조각 하나가 비면, 그 자리는 영영
+ *    번역되지 않는다. mergeTranslated 가 tier:"full" 을 찍으므로 applyFast 가
+ *    I21 로 건너뛰고, 분할된 형태 그대로 KV 에 저장되어 새로고침해도 같다.
+ *    따라서 이 함수는 k 개를 다 채우거나, 아예 실패([])를 알려야 한다.
+ *    중간은 없다 — 조용히 빈칸을 만드는 것이 이 버그의 정체였다.
+ *
+ *  packToK 만으로는 부족한 이유: packToK 는 pieces.length < k 면 k 개를 만들지
+ *    못한다. 한국어 번역은 영어·스페인어 원문보다 절 구분 문장부호가 훨씬 적어
+ *    (원문 3절 → 번역 1절) 이 상황이 상시 발생한다.
+ *    [실측: 실제 자막 4개 fixture, 24요청 209줄 중 27줄(12.6~13.1%)이 빈 번역.
+ *     사슬 밖 단독 빈 줄은 0 — 즉 LLM 이 아니라 이 경로가 원인이었다]
+ *
+ *  @returns {string[]} 길이 k, 전부 비어 있지 않음. 나눌 수 없으면 [] */
+function splitTransToK(text, k) {
+  const t = String(text).trim();
+  if (k < 2) return t ? [t] : [];
+
+  // 1차: 절 경계. 두 언어의 의미가 맞물리므로 가능하면 이쪽을 쓴다.
+  const byClause = packToK(clausePieces(t), k);
+  if (byClause.length === k && byClause.every((p) => p.trim())) return byClause;
+
+  // 2차: 글자수 비례. 경계가 어색해질 수 있지만 번역이 통째로 사라지는 것보다 낫다.
+  //   공백을 우선 찾고, 없으면(일본어·중국어처럼 띄어쓰기가 없는 언어) 글자로 자른다.
+  const out = [];
+  let rest = t;
+  for (let i = 0; i < k - 1; i++) {
+    const want = Math.round(rest.length / (k - i));
+    if (want < 1 || rest.length - want < k - i - 1) return [];   // 남은 글자가 조각 수보다 적다
+    let cut = rest.lastIndexOf(" ", want);
+    if (cut < want / 2) {
+      const fwd = rest.indexOf(" ", want);
+      cut = fwd > 0 && fwd < want * 1.5 ? fwd : want;
+    }
+    const head = rest.slice(0, cut).trim();
+    const tail = rest.slice(cut).trim();
+    if (!head || !tail) return [];
+    out.push(head);
+    rest = tail;
+  }
+  out.push(rest);
+  return out.length === k && out.every((p) => p.trim()) ? out : [];
+}
+
+/** 원문 조각들에 시간을 글자수 비례로 나눠 붙인다. tParts 가 비면 번역 없이 낸다. */
+function emitParts(line, oParts, tParts) {
   const dur = line.end - line.start;
   const total = oParts.reduce((s, p) => s + p.length, 0) || 1;
   const out = [];
   let acc = 0;
-  for (let i = 0; i < n; i++) {
+  for (let i = 0; i < oParts.length; i++) {
     const start = line.start + (dur * acc) / total;
     acc += oParts[i].length;
     out.push({ start, end: line.start + (dur * acc) / total, orig: oParts[i], trans: tParts[i] || "" });
   }
   return out;
+}
+
+/* 분할 전략은 2단이다. 원문과 번역의 절 구조가 다르기 때문이다.
+ *   [실측 14케이스] 번역의 절 개수가 9/14 에서 1개였다 (원문은 2~4절).
+ *   한국어는 영어·스페인어 한 문장을 쉼표 없이 옮기는 경우가 많다.
+ *
+ * 1차 — 의미 정렬: 원문을 "번역의 절 개수"만큼만 나눈다. 두 언어의 조각이 서로
+ *   대응하므로 학습자가 원문↔번역을 짝지어 읽을 수 있다. 대신 조각이 85자를
+ *   넘을 수 있다 (실측 최장 114자). 대응이 맞는 편이 짧은 것보다 중요하다.
+ * 2차 — 글자수 비례: 번역이 1절뿐이라 정렬이 불가능할 때. 줄은 85자 이하로
+ *   유지되지만 원문↔번역 경계가 어긋난다. 그래도 번역이 사라지는 것보다 낫다.
+ *
+ * 1차만 쓰면 정렬 불가 케이스에서 176자짜리 줄이 나오고, 2차만 쓰면 정렬 가능한
+ * 5/14 케이스까지 어긋난다. 그래서 둘 다 있다. */
+function splitLine(line) {
+  if (line.orig.length <= MAX_LINE_CHARS) return [line];
+  const oPieces = clausePieces(line.orig);
+  const capParts = packByCap(oPieces);
+  const n = capParts.length;
+  if (n < 2) return [line];
+  if (!line.trans) return emitParts(line, capParts, []);
+
+  // 1차: 절 개수를 맞춰 의미가 대응하게
+  const tPieces = clausePieces(line.trans);
+  const k = Math.min(n, tPieces.length);
+  if (k >= 2) {
+    const o = packToK(oPieces, k), t = packToK(tPieces, k);
+    if (o.length === k && t.length === k &&
+        o.every((x) => x.trim()) && t.every((x) => x.trim())) {
+      return emitParts(line, o, t);
+    }
+  }
+
+  // 2차: 글자수 비례
+  const tParts = splitTransToK(line.trans, n);
+  // W19: 그래도 n 조각이 안 나오면 분할 자체를 포기한다. 긴 한 줄이 번역이
+  //   사라진 줄보다 언제나 낫다 — 길면 읽기 불편할 뿐이지만, 비면 못 읽는다.
+  if (tParts.length !== n) return [line];
+  return emitParts(line, capParts, tParts);
 }
 
 /** 긴 줄 분할 2차 패스: 원문·번역을 의미 정렬 상태로 함께 k 등분시킨다.
@@ -568,12 +708,14 @@ async function handleSubtitle(request, env, ctx) {
   const fingerprint = await sha1(
     [...ctxB, "\u0002", ...segments.map((s) => s.text), "\u0002", ...ctxA].join("\u0001")
   );
-  // v7 (W2): LLM_MODEL 을 luna → terra 로 바꿨다. 지문은 조각 텍스트로만 만들어지므로
-  //   버전을 안 올리면 같은 키에 옛 모델의 번역이 남아 계속 서빙된다.
+  // v8 (W2·W19): splitLine 이 번역을 잃지 않도록 고쳤다. v7 캐시에는 꼬리가 빈 줄이
+  //   그대로 들어 있고, 그건 tier:"full" 로 찍혀 applyFast 가 영영 못 채운다.
+  //   버전을 안 올리면 고친 코드가 옛 빈칸을 계속 서빙해 수정이 없던 일이 된다.
+  // v7: LLM_MODEL 을 luna → terra 로 바꿨을 때.
   // mode (W13): 안 넣으면 같은 조각의 fast 요청과 full 요청이 같은 키가 된다. 먼저
   //   저장된 fast 결과(문자열 배열)가 full 요청에 나가고, 확장은 lines 를 기대하다
   //   빈 응답으로 처리한다 — 그 구간은 영영 정확한 번역을 못 받는다.
-  const key = `sub:v7:${mode}:${videoId}:${lang}:${target}:${fingerprint.slice(0, 12)}`;
+  const key = `sub:v8:${mode}:${videoId}:${lang}:${target}:${fingerprint.slice(0, 12)}`;
 
   // 불변식 W2: 위 키의 버전(sub:vN)은 출력 줄 형태가 바뀔 때마다 올려야 한다.
   //   Phase 4 실측 — 캐시 히트는 0.0초(미스 대비 약 2만배)라 이 경로가 사실상 전부다.

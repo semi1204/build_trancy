@@ -62,7 +62,15 @@ const DEFAULTS = {
  *  I8  abort signal 은 start() 진입 시 지역 변수로 캡처한다. stop() 이 state.abort 를
  *      null 로 만들기 때문에, runner 가 나중에 state.abort.signal 을 읽으면 터진다.
  *
- * 지연 예산 (Phase 4 실측: LLM 왕복 70~100초. 모든 항이 이 값에 비례한다)
+ * 지연 예산 (실측. 모든 항이 이 값에 비례한다)
+ *   실제 자막 4개 fixture × 3위치, gpt-5.6-terra, 캐시 미스, 순차 60요청:
+ *     fast N=8   수동 4.4초 / 자동 5.9초   (reasoning 수동 0, 자동 134)
+ *     full N=8   수동 14.7초 / 자동 17.6초
+ *     full N=12  수동 22.5초 / 자동 18.5초
+ *   같은 N=8 에서 fast 는 full 의 1/3 이다 — 등급 분리는 실제로 값을 한다.
+ *   ★ 옛 주석의 "왕복 70~100초"는 luna 시절 값이라 폐기했다. 아래 I12 도 그 숫자에
+ *     기대고 있었으므로 함께 다시 잡아야 한다.
+ *   재현: node scripts/bench-translation.mjs  (워커 + CLIProxyAPI 필요)
  *  I9  청크 하나의 크리티컬 패스에 LLM 왕복은 1회 이하다.               [실측]
  *  I10 모든 fetch 는 유한한 타임아웃을 가진다. 무기한 대기는 runner 슬롯을
  *      영구 점유해 처리량을 반토막 낸다.
@@ -248,26 +256,7 @@ async function fetchPlayerResponse(videoId) {
 }
 
 // ── 2. 자막 트랙 ─────────────────────────────────────────────────────
-function pickTrack(player) {
-  const tracks =
-    player?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
-  if (!tracks.length) return null;
-  const score = (t) =>
-    (cfg.prefer && t.languageCode?.startsWith(cfg.prefer) ? 2 : 0) +
-    (t.kind === "asr" ? 0 : 1);
-  return tracks.slice().sort((a, b) => score(b) - score(a))[0];
-}
-
-async function fetchSegments(track) {
-  const url = new URL(track.baseUrl);
-  url.searchParams.set("fmt", "json3");
-  const res = await fetch(url.toString(), { credentials: "include" });
-  if (!res.ok) throw new Error(`자막 트랙 ${res.status}`);
-  // 2024년부터 pot(PoToken) 없는 요청에 200 + 빈 본문을 주는 경우가 있다
-  const body = await res.text();
-  if (!body.trim()) return [];
-  const data = JSON.parse(body);
-
+function parseJson3Segments(data) {
   return (data.events || [])
     .filter((e) => e.segs)
     .map((e) => ({
@@ -276,6 +265,137 @@ async function fetchSegments(track) {
       text: e.segs.map((s) => s.utf8).join("").replace(/\s+/g, " ").trim(),
     }))
     .filter((s) => s.text);
+}
+
+/** 자막 조각의 시간을 실제 표시 구간으로 되돌린다. timedtext·패널·전사 어느
+ *  경로로 들어왔든 seedRawLines 앞에서 반드시 한 번 통과시킨다.
+ *
+ *  왜 필요한가 — 자동생성 자막은 2줄짜리 rolling 창이라 dDurationMs 가 "다음 줄로
+ *    밀려난 뒤에도 화면에 남아 있는 시간"까지 포함한다. 그래서 end 가 이웃 조각을
+ *    깊이 침범한다.
+ *    [실측 13 fixture: 수동 7개는 겹침 0. 자동 6개는 85~287쌍이 겹치고
+ *     최대 겹침 9.30초(D8A2q3awnsU). 클램프 후 전부 0, 조각 수·본문·start 불변,
+ *     중앙 길이 2.2~3.8초 유지]
+ *
+ *  end 는 조용히 여러 곳으로 번진다 — findLine 의 표시 판정, state.loop 의 되감기
+ *    (currentTime > cur.end), 청크 구간 t1, 워커가 돌려주는 full 줄의 end.
+ *    9초 부풀려진 end 는 "이 문장 반복"을 세 문장 반복으로 만든다.
+ *
+ *  조각을 버리지 않는 이유 — 버리면 그 시각이 어떤 줄에도 안 덮여 I5 의 구멍이
+ *    된다. 길이가 0 이하인 조각도 최소 길이를 줘서 살린다.
+ *
+ *  @param {Segment[]} segments
+ *  @param {number|null} duration  영상 길이(초). 모르면 null — 길이 클램프만 건너뛴다
+ *  @returns {Segment[]} start 오름차순, 겹침 없음, 모두 end > start */
+const MIN_SEG_SEC = 0.2;   // 겹침 제거 후에도 조각이 사라지지 않게 하는 하한
+const TAIL_SEG_SEC = 8;    // 끝을 알 수 없는 마지막 조각의 기본 길이 (패널 수집용)
+function normalizeSegments(segments, duration) {
+  const out = segments
+    .filter((s) => Number.isFinite(s.start) && s.text)
+    .map((s) => ({ ...s, start: Math.max(0, s.start), end: Number(s.end) }))
+    .sort((a, b) => a.start - b.start);
+
+  const limit = Number.isFinite(duration) && duration > 0 ? duration : Infinity;
+  for (let i = 0; i < out.length; i++) {
+    const next = out[i + 1];
+    // end 가 Infinity 면 "다음 조각까지 늘려라"라는 뜻이다 (패널은 시작 시각만 준다).
+    // NaN 은 값이 없는 것이므로 start 로 접었다가 아래 하한 규칙에 맡긴다.
+    let end = Number.isNaN(out[i].end) ? out[i].start : out[i].end;
+    if (next) end = Math.min(end, next.start);   // rolling 겹침 제거
+    end = Math.min(end, limit);
+    if (!Number.isFinite(end)) end = out[i].start + TAIL_SEG_SEC;   // 뒤도 길이도 모를 때
+    // 클램프 결과가 0 이하가 되면(겹침이 아주 심하거나 길이를 넘은 조각) 하한을
+    // 준다. 다음 조각 start 를 넘지 않는 선에서만 — 넘으면 겹침을 다시 만든다.
+    // 버리지 않는 이유: 버리면 그 시각이 어떤 줄에도 안 덮여 I5 의 구멍이 된다.
+    if (end <= out[i].start) {
+      const room = next ? next.start - out[i].start : MIN_SEG_SEC;
+      end = out[i].start + (room > 0 ? Math.min(MIN_SEG_SEC, room) : MIN_SEG_SEC);
+    }
+    out[i].end = end;
+  }
+  return out;
+}
+
+/** 두 언어 코드가 같은 언어인가. "en" 과 "en-US" 는 같다. */
+function sameLang(a, b) {
+  if (!a || !b) return false;
+  const base = (x) => String(x).toLowerCase().split("-")[0];
+  return base(a) === base(b);
+}
+
+/** 자막 트랙 하나를 고른다. 우선순위는 원어 → 수동 → prefer → 원래 순서.
+ *
+ *  왜 언어보다 원어가 먼저인가 — 이건 듣기 학습 도구다. 들리는 소리와 다른 언어의
+ *    자막을 띄우면 원문 대조가 성립하지 않는다. 옛 코드는 prefer 언어 일치에
+ *    가중치 2, 수동/자동에 1 을 줘서 언어가 이겼다. prefer="en" 인 사용자가
+ *    스페인어 영상을 열면 en 트랙이 뽑혀 스페인어를 하나도 못 듣게 된다.
+ *
+ *  왜 수동이 자동을 이기는가 — 자동생성은 구두점이 없고 문장 중간에서 끊긴다
+ *    (실측 13 fixture: 자동 6개 전부 구두점 0, 이웃과 최대 9.30초 겹침).
+ *    같은 언어라면 사람이 단 자막이 언제나 낫다.
+ *
+ *  prefer 는 원어를 판정할 수 없을 때만 쓰는 힌트로 내려왔다. */
+function pickTrack(player) {
+  const renderer = player?.captions?.playerCaptionsTracklistRenderer;
+  const tracks = renderer?.captionTracks || [];
+  if (!tracks.length) return null;
+
+  // 자동 번역으로 파생된 트랙은 원문이 아니다 — 유튜브가 다른 언어 자막을 기계
+  // 번역한 것이라 원문 대조에 쓸 수 없다. 다만 후보가 그것뿐이면 빈손보다 낫다.
+  const isTranslated = (t) => !!t.translatedLanguage || String(t.vssId || "").startsWith(".");
+  const pool = tracks.filter((t) => !isTranslated(t));
+  const cands = pool.length ? pool : tracks;
+
+  // 원어 판정. 앞쪽일수록 근거가 강하다.
+  //   ASR 트랙의 언어가 곧 원어인 이유: 자동생성 자막은 들리는 소리를 옮긴 것이다.
+  const audioDefault = renderer?.audioTracks?.[0]?.defaultCaptionTrackIndex;
+  const origin =
+    player?.videoDetails?.defaultAudioLanguage ||
+    tracks.find((t) => t.kind === "asr")?.languageCode ||
+    (Number.isInteger(audioDefault) ? tracks[audioDefault]?.languageCode : null) ||
+    cfg.prefer ||
+    null;
+
+  const score = (t) =>
+    (sameLang(t.languageCode, origin) ? 4 : 0) +
+    (t.kind === "asr" ? 0 : 2) +
+    (sameLang(t.languageCode, cfg.prefer) ? 1 : 0);
+
+  // 동점이면 유튜브가 준 순서를 지킨다 (sort 는 안정 정렬이다)
+  return cands.slice().sort((a, b) => score(b) - score(a))[0];
+}
+
+/**
+ * @typedef {object} FetchResult  자막 수집 한 경로의 결과
+ * @property {Segment[]} segments  실패하면 빈 배열
+ * @property {"ok"|"no-track"|"empty-body"|"http-error"|"parse-error"|"no-panel"} reason
+ *
+ * 왜 빈 배열만으로는 안 되나 — "자막이 없다"와 "수집이 실패했다"가 같은 값이 되면
+ *   호출부가 둘을 구분할 수 없고, 그래서 수집 실패에도 Whisper 전사가 돌았다.
+ *   전사는 유료이고 사용자는 자막이 있는 영상인 줄 알므로 사고를 알아채지 못한다.
+ */
+async function fetchSegments(track) {
+  let res;
+  try {
+    const url = new URL(track.baseUrl);
+    url.searchParams.set("fmt", "json3");
+    res = await fetch(url.toString(), { credentials: "include" });
+  } catch (e) {
+    return { segments: [], reason: "http-error" };
+  }
+  if (!res.ok) return { segments: [], reason: "http-error" };
+  // 2024년부터 pot(PoToken) 없는 요청에 200 + 빈 본문을 주는 경우가 있다.
+  // 이건 "자막 없음"이 아니라 "막힘"이다 — 구분해서 올려야 전사 오발동을 막는다.
+  const body = await res.text();
+  if (!body.trim()) return { segments: [], reason: "empty-body" };
+  try {
+    const segments = parseJson3Segments(JSON.parse(body));
+    return segments.length
+      ? { segments, reason: "ok" }
+      : { segments: [], reason: "empty-body" };
+  } catch {
+    return { segments: [], reason: "parse-error" };
+  }
 }
 
 /** timedtext 가 막혔을 때: 유튜브 자체 스크립트 패널을 열어 DOM 에서 긁는다.
@@ -293,7 +413,10 @@ async function scrapeTranscriptPanel() {
     const expand = $("tp-yt-paper-button#expand, #description-inline-expander #expand");
     if (expand) { expand.click(); await new Promise((r) => setTimeout(r, 500)); }
     const btn = $("ytd-video-description-transcript-section-renderer button");
-    if (!btn) return [];                   // 자막 없는 영상엔 버튼 자체가 없다
+    // 버튼이 없다 = 이 영상에 패널이 없거나, 유튜브가 셀렉터를 바꿨다.
+    // 둘을 여기서 구분할 방법이 없으므로 "실패"로 올린다 — captionTracks 가 있는데
+    // 이쪽이 실패했다면 자막은 있는 것이고, 전사로 넘어가면 안 된다.
+    if (!btn) return { segments: [], reason: "no-panel" };
     btn.click();
   }
 
@@ -313,29 +436,63 @@ async function scrapeTranscriptPanel() {
     const start = parseTimestamp(tsEl.textContent);
     const text = txtEl.textContent.replace(/\s+/g, " ").trim();
     if (start == null || !text) continue;
-    segments.push({ start, end: 0, text });
+    // 패널은 시작 시각만 준다. 끝은 normalizeSegments 가 "다음 조각의 시작"으로
+    // 채운다 — 여기서 직접 계산하면 같은 규칙이 두 곳에 생겨 갈라진다.
+    segments.push({ start, end: Infinity, text });
   }
-  for (let i = 0; i < segments.length; i++) {
-    segments[i].end = i + 1 < segments.length ? segments[i + 1].start : dur || segments[i].start + 8;
+  if (segments.length) {
+    const last = segments[segments.length - 1];
+    last.end = dur || last.start + 8;      // 마지막 조각만 뒤가 없어 따로 정한다
   }
 
   if (!wasOpen) {
     $('ytd-engagement-panel-section-list-renderer[visibility="ENGAGEMENT_PANEL_VISIBILITY_EXPANDED"] #visibility-button button')?.click();
   }
-  return segments;
+  return segments.length
+    ? { segments, reason: "ok" }
+    : { segments: [], reason: "no-panel" };
+}
+
+/** 어느 자막 원천을 쓸지 정한다. startAsr 로 가는 유일한 관문이다.
+ *
+ *  규칙 — captionTracks 가 비어 있을 때(그리고 라이브일 때)만 전사를 허용한다.
+ *    트랙이 있는데 두 수집 경로가 모두 실패했다면 그건 "자막 없음"이 아니라
+ *    "수집 실패"이고, 전사는 사고다. 사용자는 자막이 있는 영상인 줄 알기 때문에
+ *    Groq 요금이 조용히 나가도 알아채지 못한다.
+ *
+ *  @param {object|null} player  ytInitialPlayerResponse
+ *  @param {FetchResult} cap     timedtext 결과
+ *  @param {FetchResult} panel   스크립트 패널 결과
+ *  @returns {{kind:"captions"|"asr"|"fail", segments?: Segment[], reason: string}} */
+function chooseSource(player, cap, panel) {
+  // 라이브는 완결된 트랙이 없다 — 지금 이 순간까지만 존재하므로 전사로 간다
+  if (player?.videoDetails?.isLive) return { kind: "asr", reason: "live" };
+
+  const tracks = player?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
+  if (cap.reason === "ok") return { kind: "captions", segments: cap.segments, reason: "timedtext" };
+  if (panel.reason === "ok") return { kind: "captions", segments: panel.segments, reason: "panel" };
+  if (!tracks.length) return { kind: "asr", reason: "no-track" };
+
+  return {
+    kind: "fail",
+    reason: `자막 트랙은 있는데 수집에 실패했습니다 (timedtext: ${cap.reason}, 패널: ${panel.reason})`,
+  };
 }
 
 // ── 3. Worker ────────────────────────────────────────────────────────
 /* 불변식 I10·I11·I12 가 걸리는 지점이다.
- *  I10  이 fetch 는 반드시 유한 타임아웃을 가진다.
- *  I11  ★ 현재 위반 중: 아래 `attempt >= 1` 재시도가 워커의 3회 재시도와 곱해져
- *       청크 하나에 LLM 호출이 최대 6회(≈10분) 발생한다. 재시도는 한 층에만 둔다 —
- *       여기를 없애고 start() 의 청크 재큐에 맡기거나, 워커 재시도를 1회로 낮춘다.
- *  I12  타임아웃 값 > 워커 최대 소요. Phase 4 실측 LLM 왕복 70~100초 기준으로
- *       워커가 3회까지 쓰면 210~300초이므로 그보다 커야 한다.
+ *  I10  이 fetch 는 반드시 유한 타임아웃을 가진다. 없으면 멈춘 업스트림 하나가
+ *       runner 슬롯을 영구 점유해 처리량이 반토막 난다.
+ *  I11  재시도는 한 층에만 둔다. 여기서는 재시도하지 않는다 — start() 의 청크
+ *       재큐(1회)와 워커의 3회가 이미 있고, 여기에 한 층을 더하면 곱해진다.
+ *       [실측: fast 요청 하나가 36,960ms 걸린 뒤 degraded(빈 문자열 8개)로 끝났다.
+ *        워커가 3회를 다 쓴 결과다. 여기서 또 재시도했다면 74초였다]
+ *  I12  타임아웃 값 > 워커 최대 소요. 워커 LLM_TIMEOUT_MS=165초 × 3회 + 백오프
+ *       3.5초 = 최대 498초. 그보다 커야 워커의 재시도가 끝나기 전에 끊지 않는다.
  *  I8   signal 은 호출자가 지역 캡처한 것을 받는다. state.abort 를 직접 읽지 않는다. */
+const REQUEST_TIMEOUT_MS = 510000;   // I12: 워커 최대 소요(498초)보다 크게
+
 /**
- * 목표 계약 (Phase 6 에서 구현). 지금은 Line[] 만 반환한다.
  * @param {"fast"|"full"} mode  등급. 워커의 프롬프트·응답 형태가 이 값으로 갈린다.
  * @returns {Promise<{lines?: Line[], t?: string[], usage?: Usage}>}
  *   mode=full 이면 lines, mode=fast 면 t 가 온다. 둘은 동시에 오지 않는다.
@@ -343,47 +500,53 @@ async function scrapeTranscriptPanel() {
  *   이 함수 안에서 소비되므로 호출부가 따로 읽을 방법이 없다.
  */
 async function requestTranslation(videoId, lang, segments, ctx = {}, signal = null, mode = "full") {
-  // TODO(phase6): 요청 1회의 타임아웃을 건다. 내부에 AbortController 를 만들고 전달받은
-  //   signal 의 "abort" 이벤트를 addEventListener 로 수동 연결한다. AbortSignal.any() 는
-  //   Firefox 124+ 라 manifest 의 strict_min_version 115 에서 조용히 깨진다.
-  //   타임아웃이 없으면 멈춘 업스트림 하나가 runner 슬롯을 영구 점유해 처리량이 반토막 난다 (불변식 10).
-  for (let attempt = 0; ; attempt++) {
-    try {
-      const res = await fetch(`${cfg.endpoint}/api/subtitle`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        signal,
-        body: JSON.stringify({
-          videoId,
-          lang,
-          target: cfg.target,
-          segments,
-          ctxBefore: ctx.before || [],   // 청크 경계에서도 번역이 이어지게
-          ctxAfter: ctx.after || [],
-          mode,
-        }),
-      });
-      if (!res.ok) {
-        const detail = await res.text().catch(() => "");
-        throw new Error(`서버 ${res.status} ${detail.slice(0, 120)}`);
-      }
-      const payload = await res.json();
-      // I18: fast 는 길이 일치가 유일한 계약이다. 밀린 채로 받아들이면 엉뚱한 시각에
-      //   엉뚱한 번역이 붙고, 화면만 봐서는 알아챌 수 없다. 통째로 버린다.
-      if (mode === "fast") {
-        if (!Array.isArray(payload.t) || payload.t.length !== segments.length) {
-          throw new Error(`fast 길이 불일치 ${payload.t?.length}/${segments.length}`);
-        }
-        return { t: payload.t, usage: payload.usage };
-      }
-      const lines = payload.lines;
-      if (!Array.isArray(lines) || !lines.length) throw new Error("빈 응답");
-      return { lines, usage: payload.usage };
-    } catch (e) {
-      if (signal?.aborted) throw e;        // 세션 종료 — 재시도하지 않는다 (I7)
-      if (attempt >= 1) throw e;           // 1회 재시도 후 포기
-      await new Promise((r) => setTimeout(r, 1200));
+  // I10: 요청 1회의 타임아웃. AbortSignal.any() 는 Firefox 124+ 라 manifest 의
+  //   strict_min_version 115 에서 조용히 깨진다 — 그래서 수동으로 연결한다.
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(new Error("timeout")), REQUEST_TIMEOUT_MS);
+  const onAbort = () => ctl.abort();
+  if (signal) {
+    if (signal.aborted) ctl.abort();
+    else signal.addEventListener("abort", onAbort);
+  }
+  const cleanup = () => {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", onAbort);
+  };
+
+  try {
+    const res = await fetch(`${cfg.endpoint}/api/subtitle`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal: ctl.signal,
+      body: JSON.stringify({
+        videoId,
+        lang,
+        target: cfg.target,
+        segments,
+        ctxBefore: ctx.before || [],   // 청크 경계에서도 번역이 이어지게
+        ctxAfter: ctx.after || [],
+        mode,
+      }),
+    });
+    if (!res.ok) {
+      const detail = await res.text().catch(() => "");
+      throw new Error(`서버 ${res.status} ${detail.slice(0, 120)}`);
     }
+    const payload = await res.json();
+    // I18: fast 는 길이 일치가 유일한 계약이다. 밀린 채로 받아들이면 엉뚱한 시각에
+    //   엉뚱한 번역이 붙고, 화면만 봐서는 알아챌 수 없다. 통째로 버린다.
+    if (mode === "fast") {
+      if (!Array.isArray(payload.t) || payload.t.length !== segments.length) {
+        throw new Error(`fast 길이 불일치 ${payload.t?.length}/${segments.length}`);
+      }
+      return { t: payload.t, usage: payload.usage };
+    }
+    const lines = payload.lines;
+    if (!Array.isArray(lines) || !lines.length) throw new Error("빈 응답");
+    return { lines, usage: payload.usage };
+  } finally {
+    cleanup();
   }
 }
 
@@ -423,6 +586,7 @@ async function transcribeChunk(blob, chunkStart, rate) {
 
 async function appendAsrLines(segments) {
   if (!segments.length) return;
+  segments = normalizeSegments(segments, null);   // 전사분도 같은 규칙을 통과시킨다
   let lines;
   try {
     lines = await requestTranslation(`${state.videoId}#asr`, cfg.prefer || "auto", segments, {
@@ -791,6 +955,35 @@ function applyFast(segs, trans) {
   state.idx = -2;
 }
 
+/** fast 미리보기로 보낼 조각 창을 고른다. 재생 지점부터 size 조각이다.
+ *
+ *  왜 청크 머리가 아니라 재생 지점인가 — 청크는 12조각(약 30~45초)이라 재생 지점이
+ *    그 안 어디든 될 수 있다. 머리에서 자르면 이미 지나간 구간을 번역하게 된다.
+ *    [실측: 실제 자막 13개 fixture × seek 200지점 — 머리 방식은 재생 지점을 덮는
+ *     비율이 65~70%뿐이고, 번역한 조각의 60~67%가 이미 지나간 것이었다.
+ *     재생 지점 앵커는 덮음 100% / 낭비 0%]
+ *
+ *  왜 청크 경계를 넘는가 — 청크 안으로 제한하면 재생 지점이 청크 끝에 걸릴 때
+ *    창이 1~2조각으로 쪼그라든다. 실측상 그 경우 미리보기 지평이 5초 미만인 seek 이
+ *    15.3% 였는데, full 은 18~22초 걸리므로 미리보기가 먼저 끊긴다. 넘기면 지평
+ *    평균 ~20초로 full 도착까지 덮는다 (지평<5s 2.7%).
+ *    창이 청크를 넘어도 안전한 이유는 applyFast 가 배열 인덱스가 아니라 시각으로
+ *    줄을 찾기 때문이다 (I22).
+ *
+ *  @param {Segment[]} segments  전체 조각
+ *  @param {Chunk}     chunk     지금 재생 중으로 뽑힌 청크
+ *  @param {number}    t         현재 재생 위치(초)
+ *  @param {number}    size      창 크기(조각 수)
+ *  @returns {{from: number, segs: Segment[]}} from 은 segments 에서의 시작 인덱스 */
+function fastWindow(segments, chunk, t, size) {
+  // 아직 끝나지 않은 첫 조각 = 지금 보고 있거나 곧 볼 조각.
+  // 재생 지점이 청크 시작 전이면(nextChunk 의 5초 선행) findIndex 가 0 을 준다.
+  let p = chunk.segs.findIndex((s) => s.end >= t);
+  if (p < 0) p = 0;
+  const from = chunk.i0 + p;
+  return { from, segs: segments.slice(from, from + size) };
+}
+
 function findLine(t) {
   const L = state.lines;
   let lo = 0, hi = L.length - 1, best = -1;
@@ -883,21 +1076,42 @@ async function start() {
     state.perf.tPlayer = performance.now() - state.perf.t0;
     state.title = player?.videoDetails?.title || document.title;
 
-    // 라이브는 완결된 자막 트랙이 없다 → 바로 Whisper 전사 모드
-    if (player?.videoDetails?.isLive) { startAsr(); return; }
-
-    const track = pickTrack(player);
-    let segments = [];
+    const live = !!player?.videoDetails?.isLive;
+    const track = live ? null : pickTrack(player);
+    let cap = { segments: [], reason: "no-track" };
+    let panel = { segments: [], reason: "no-panel" };
     if (track) {
       showStatus("자막 불러오는 중", true);
-      segments = await fetchSegments(track).catch((e) => (log("timedtext 실패", e.message), []));
-      if (!segments.length) {
-        log("timedtext 빈 응답 → 스크립트 패널에서 수집");
-        segments = await scrapeTranscriptPanel().catch((e) => (log("패널 수집 실패", e.message), []));
+      cap = await fetchSegments(track)
+        .catch((e) => (log("timedtext 실패", e.message), { segments: [], reason: "http-error" }));
+      if (cap.reason !== "ok") {
+        log(`timedtext 실패(${cap.reason}) → 스크립트 패널에서 수집`);
+        panel = await scrapeTranscriptPanel()
+          .catch((e) => (log("패널 수집 실패", e.message), { segments: [], reason: "no-panel" }));
       }
     }
-    // 트랙이 없거나 두 경로 모두 막힘 → Whisper 전사 모드
-    if (!segments.length) { startAsr(); return; }
+
+    // startAsr 로 가는 유일한 관문. 조건을 여기 밖에 두면 "수집 실패인데 전사"가
+    // 다시 살아난다 (test/asr-guard.test.js 가 호출부 개수까지 검사한다).
+    const src = chooseSource(player, cap, panel);
+    if (src.kind === "asr") { startAsr(); return; }
+    if (src.kind === "fail") {
+      // 여기서 전사로 넘어가지 않는다. 자막이 있는 영상이므로 사용자에게 알리고 멈춘다.
+      log("자막 수집 실패", src.reason);
+      showStatus(`오류: ${src.reason}`);
+      state.active = false;
+      syncBar();
+      return;
+    }
+    let segments = src.segments;
+
+    // 어느 경로로 들어왔든 여기서 한 번 시간을 정리한다. 자동생성 자막의 rolling
+    // 겹침(실측 최대 9.30초)을 여기서 안 걷으면 end 가 findLine·state.loop·청크 t1·
+    // 워커 응답까지 그대로 번진다.
+    {
+      const v = $("video");
+      segments = normalizeSegments(segments, v && isFinite(v.duration) ? v.duration : null);
+    }
 
     state.perf.tSegs = performance.now() - state.perf.t0;
     seedRawLines(segments);        // I1: 이 시점부터 화면은 비지 않는다
@@ -911,8 +1125,11 @@ async function start() {
     // 나머지는 백그라운드로 채운다. 이웃 세그먼트는 문맥(CTX)으로 함께 보낸다.
     // 두 격자는 정렬될 필요가 없다 — fast 는 시각으로 제자리 대입하고(I22) full 은
     // 시간 구간을 교체하므로, 서로 다른 크기여도 안전하다.
-    const TRANSLATE_CHUNK = 12;   // full 격자.       [실측: terra 9.7초]
-    const FAST_CHUNK = 8;         // 재생 중 미리보기. [실측: terra 2.7초, reasoning 0]
+    // [실측 60요청, 실제 자막 4개 fixture. 수동/자동 = 사람이 단 자막 / 자동생성 자막]
+    const TRANSLATE_CHUNK = 12;   // full 격자.       [수동 22.5초 / 자동 18.5초]
+    const FAST_CHUNK = 8;         // 재생 중 미리보기. [수동 4.4초 / 자동 5.9초]
+    // 같은 N=8 로 재면 full 은 14.7/17.6초 — fast 가 3배 빠르다. 크기가 아니라
+    // 등급(프롬프트·reasoning)이 만드는 차이다.
     state.perf.segsPerChunk = TRANSLATE_CHUNK;
     const CTX_N = 8;
     const chunks = [];
@@ -953,13 +1170,19 @@ async function start() {
         // 재생 중이고 아직 미리보기를 안 받은 청크만 fast (I16). previewed 가 없으면
         // 같은 청크가 계속 재생 중인 동안 fast 만 무한히 반복한다.
         const mode = playing && !previewed.has(c) ? "fast" : "full";
-        const segs = mode === "fast" ? c.segs.slice(0, FAST_CHUNK) : c.segs;
+        // fast 는 청크 머리가 아니라 재생 지점부터 자른다 (fastWindow 주석의 실측 참조).
+        // 창은 청크 경계를 넘을 수 있으므로 base 는 c.i0 이 아니라 창의 시작이다 —
+        // CTX 를 c.i0 기준으로 붙이면 창과 무관한 앞뒤 문맥이 실려 번역이 어긋난다.
+        const win = mode === "fast"
+          ? fastWindow(segments, c, $("video")?.currentTime || 0, FAST_CHUNK)
+          : { from: c.i0, segs: c.segs };
+        const { from: base, segs } = win;
         pending.delete(c);
         const tReq = performance.now();
         try {
           const res = await requestTranslation(videoId, track.languageCode, segs, {
-            before: segments.slice(Math.max(0, c.i0 - CTX_N), c.i0).map((s) => s.text),
-            after: segments.slice(c.i0 + segs.length, c.i0 + segs.length + CTX_N).map((s) => s.text),
+            before: segments.slice(Math.max(0, base - CTX_N), base).map((s) => s.text),
+            after: segments.slice(base + segs.length, base + segs.length + CTX_N).map((s) => s.text),
           }, sig, mode);
           if (state.gen !== myGen || !state.active) return;   // I6
           // 두 배열은 같은 인덱스로 정렬된다 — 어긋나면 "이 지연이 이 토큰에서
@@ -969,7 +1192,13 @@ async function start() {
           if (mode === "fast") {
             applyFast(segs, res.t);                          // I2·I3·I5·I21·I22
             state.perf.tierCounts.fast++;
-            previewed.add(c);
+            // 창이 청크 경계를 넘었으면 닿은 청크를 전부 표시한다. c 만 표시하면
+            // 다음 청크가 자기 fast 를 또 요청해 방금 번역한 구간을 중복 번역한다.
+            const lastIdx = base + segs.length - 1;
+            for (let k = Math.floor(base / TRANSLATE_CHUNK);
+                 k <= Math.floor(lastIdx / TRANSLATE_CHUNK) && k < chunks.length; k++) {
+              previewed.add(chunks[k]);
+            }
             pending.add(c);   // full 로 승급. 안 되돌리면 거친 번역인 채로 영영 남는다
           } else {
             mergeTranslated(res.lines, c.t0, c.t1);          // I2·I3·I4·I5·I23
