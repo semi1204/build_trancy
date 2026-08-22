@@ -53,28 +53,59 @@ test("★ 자동생성 자막의 rolling 겹침이 사라진다", { skip }, () =
   assert.deepEqual(after, [], `정규화 후에도 겹침이 남았다 (전: ${before.join(", ")})`);
 });
 
-test("★ 수동 자막은 한 글자도 바뀌지 않는다", { skip }, () => {
+test("★ 고칠 것이 없는 자막은 한 글자도 바뀌지 않는다", { skip }, () => {
+  // "수동 자막은 안 바뀐다"가 아니다 — 그 전제는 틀렸다. Twitch 채팅을 자막
+  // 트랙으로 올린 영상(VBMUMuZBxw0-chat)은 manual 인데 겹침이 1668개다.
+  // 실제 성질은 "겹치지도, 길이를 넘지도, 시각이 중복되지도 않으면 그대로"다.
   const y = loadContent();
-  for (const fx of manual()) {
-    const norm = y.normalizeSegments(fx.segments, fx.durationSeconds);
+  let checked = 0;
+  for (const fx of FIXTURES) {
+    const s = fx.segments;
+    const clean =
+      s.every((x, i) => i === 0 || s[i - 1].end <= x.start + 1e-9) &&
+      s.every((x, i) => i === 0 || s[i - 1].start !== x.start) &&
+      s.every((x) => x.end <= fx.durationSeconds + 1e-9 && x.end > x.start);
+    if (!clean) continue;
+    checked++;
     assert.deepEqual(
-      JSON.parse(JSON.stringify(norm)),
-      JSON.parse(JSON.stringify(fx.segments)),
-      `수동 자막이 변형됐다 — ${fx.id}`,
+      JSON.parse(JSON.stringify(y.normalizeSegments(s, fx.durationSeconds))),
+      JSON.parse(JSON.stringify(s)),
+      `멀쩡한 자막이 변형됐다 — ${fx.id}`,
     );
+  }
+  assert.ok(checked >= 5, `검사한 fixture 가 ${checked}개뿐이다`);
+});
+
+test("★ 같은 시각에 시작하는 조각도 각자 자리를 받는다", { skip }, () => {
+  // 동시에 올라온 채팅 등. 그대로 두면 findLine 이 마지막 하나만 골라
+  // 나머지는 영영 안 보이고, 하한 규칙이 서로 겹치는 줄을 만든다.
+  const y = loadContent();
+  for (const fx of FIXTURES) {
+    const dup = fx.segments.filter((s, i) => i && fx.segments[i - 1].start === s.start).length;
+    if (!dup) continue;
+    const norm = y.normalizeSegments(fx.segments, fx.durationSeconds);
+    for (let i = 1; i < norm.length; i++) {
+      assert.ok(norm[i - 1].start < norm[i].start,
+        `${fx.id}: 시작 시각이 여전히 겹친다 (${norm[i].start})`);
+    }
   }
 });
 
-test("정규화가 조각을 잃거나 0초로 만들지 않는다", { skip }, () => {
+test("정규화가 조각을 0초로 만들지 않는다", { skip }, () => {
   const y = loadContent();
   for (const fx of FIXTURES) {
     const norm = y.normalizeSegments(fx.segments, fx.durationSeconds);
-    assert.equal(norm.length, fx.segments.length, `조각 수가 바뀌었다 — ${fx.id}`);
+    // 영상이 끝난 뒤 조각만 빠질 수 있다 — 재생 위치가 닿지 못하는 것들이다
+    const reachable = fx.segments.filter((s) => s.start < fx.durationSeconds).length;
+    assert.equal(norm.length, reachable, `조각 수가 예상과 다르다 — ${fx.id}`);
     for (const [i, s] of norm.entries()) {
       assert.ok(s.end > s.start, `${fx.id}[${i}] end <= start (${s.start}→${s.end})`);
-      assert.equal(s.text, fx.segments[i].text, `${fx.id}[${i}] 본문이 바뀌었다`);
-      assert.equal(s.start, fx.segments[i].start, `${fx.id}[${i}] start 가 움직였다`);
+      assert.ok(typeof s.text === "string" && s.text, `${fx.id}[${i}] 본문이 비었다`);
     }
+    // 본문은 순서 그대로 보존된다
+    assert.deepEqual(norm.map((s) => s.text),
+      fx.segments.filter((s) => s.start < fx.durationSeconds).map((s) => s.text),
+      `본문이나 순서가 바뀌었다 — ${fx.id}`);
   }
 });
 

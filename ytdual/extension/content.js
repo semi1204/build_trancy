@@ -173,6 +173,9 @@ let state = {
   /** @type {AbortController|null} 이번 세대의 진행 중 요청들을 한 번에 끊는 손잡이.
    *  stop() 에서 null 이 되므로 runner 는 이 필드를 직접 읽지 말고 지역 캡처본을 쓴다 (I8) */
   abort: null,
+  /** @type {Function[]} 이번 세대가 등록한 리스너를 stop() 에서 되돌리는 훅.
+   *  안 떼면 세션이 바뀔 때마다 <video> 에 리스너가 쌓인다. */
+  cleanups: [],
   /** @type {Perf} */
   perf: {
     t0: 0, tPlayer: 0, tSegs: 0, tFirstPaint: 0, tFirstTrans: 0,
@@ -267,12 +270,34 @@ function parseJson3Segments(data) {
 const MIN_SEG_SEC = 0.2;   // 겹침 제거 후에도 조각이 사라지지 않게 하는 하한
 const TAIL_SEG_SEC = 8;    // 끝을 알 수 없는 마지막 조각의 기본 길이 (패널 수집용)
 function normalizeSegments(segments, duration) {
+  const limit = Number.isFinite(duration) && duration > 0 ? duration : Infinity;
   const out = segments
     .filter((s) => Number.isFinite(s.start) && s.text)
+    // 영상이 끝난 뒤에 찍힌 조각은 재생 위치가 절대 닿지 못한다. 남겨 두면
+    // 길이 클램프가 end 를 start 아래로 밀어 하한 규칙이 발동하고, 그 결과
+    // 영상 길이를 넘는 줄이 생긴다.
+    // [실측: Twitch 채팅 트랙에서 방송 종료 후 메시지 6개]
+    .filter((s) => s.start < limit)
     .map((s) => ({ ...s, start: Math.max(0, s.start), end: Number(s.end) }))
     .sort((a, b) => a.start - b.start);
 
-  const limit = Number.isFinite(duration) && duration > 0 ? duration : Infinity;
+  // 같은 시각에 시작하는 조각들 — 동시에 올라온 자막(채팅 등)이다. 그대로 두면
+  // findLine 이 마지막 하나만 고르고 나머지는 영영 안 보이며, 아래 하한 규칙이
+  // 서로 겹치는 줄을 만든다. 다음 시작 시각까지를 균등하게 나눠 각자 자리를 준다.
+  // [실측: Twitch 채팅 트랙 3381조각 중 4묶음]
+  for (let i = 0; i < out.length;) {
+    let j = i;
+    while (j + 1 < out.length && out[j + 1].start === out[i].start) j++;
+    if (j > i) {
+      const t0 = out[i].start;
+      const n = j - i + 1;
+      const room = Math.min(out[j + 1]?.start ?? Infinity, limit) - t0;
+      const step = (Number.isFinite(room) && room > 0 ? room : n * MIN_SEG_SEC) / n;
+      for (let k = i + 1; k <= j; k++) out[k].start = t0 + step * (k - i);
+    }
+    i = j + 1;
+  }
+
   for (let i = 0; i < out.length; i++) {
     const next = out[i + 1];
     // end 가 Infinity 면 "다음 조각까지 늘려라"라는 뜻이다 (패널은 시작 시각만 준다).
@@ -282,10 +307,11 @@ function normalizeSegments(segments, duration) {
     end = Math.min(end, limit);
     if (!Number.isFinite(end)) end = out[i].start + TAIL_SEG_SEC;   // 뒤도 길이도 모를 때
     // 클램프 결과가 0 이하가 되면(겹침이 아주 심하거나 길이를 넘은 조각) 하한을
-    // 준다. 다음 조각 start 를 넘지 않는 선에서만 — 넘으면 겹침을 다시 만든다.
+    // 준다. 다음 조각 start 와 영상 끝을 넘지 않는 선에서만 — 넘으면 겹침이나
+    // 길이 초과를 다시 만든다.
     // 버리지 않는 이유: 버리면 그 시각이 어떤 줄에도 안 덮여 I5 의 구멍이 된다.
     if (end <= out[i].start) {
-      const room = next ? next.start - out[i].start : MIN_SEG_SEC;
+      const room = Math.min(next ? next.start : Infinity, limit) - out[i].start;
       end = out[i].start + (room > 0 ? Math.min(MIN_SEG_SEC, room) : MIN_SEG_SEC);
     }
     out[i].end = end;
@@ -300,18 +326,6 @@ function sameLang(a, b) {
   return base(a) === base(b);
 }
 
-/** 자막 트랙 하나를 고른다. 우선순위는 원어 → 수동 → prefer → 원래 순서.
- *
- *  왜 언어보다 원어가 먼저인가 — 이건 듣기 학습 도구다. 들리는 소리와 다른 언어의
- *    자막을 띄우면 원문 대조가 성립하지 않는다. 옛 코드는 prefer 언어 일치에
- *    가중치 2, 수동/자동에 1 을 줘서 언어가 이겼다. prefer="en" 인 사용자가
- *    스페인어 영상을 열면 en 트랙이 뽑혀 스페인어를 하나도 못 듣게 된다.
- *
- *  왜 수동이 자동을 이기는가 — 자동생성은 구두점이 없고 문장 중간에서 끊긴다
- *    (실측 13 fixture: 자동 6개 전부 구두점 0, 이웃과 최대 9.30초 겹침).
- *    같은 언어라면 사람이 단 자막이 언제나 낫다.
- *
- *  prefer 는 원어를 판정할 수 없을 때만 쓰는 힌트로 내려왔다. */
 function pickTrack(player) {
   const renderer = player?.captions?.playerCaptionsTracklistRenderer;
   const tracks = renderer?.captionTracks || [];
@@ -953,6 +967,8 @@ async function start() {
   state.active = true;
   const myGen = ++state.gen;                  // I6
   state.abort = new AbortController();
+  for (const fn of state.cleanups.splice(0)) { try { fn(); } catch {} }
+  const cleanups = state.cleanups;
   const sig = state.abort.signal;             // I8: 지역 캡처 (stop() 이 state.abort 를 비운다)
   state.perf = {
     t0: performance.now(), tPlayer: 0, tSegs: 0, tFirstPaint: 0, tFirstTrans: 0,
@@ -1015,62 +1031,117 @@ async function start() {
     document.documentElement.classList.add("ytdual-on");
 
     // 긴 자막을 한 요청으로 보내면 응답까지 몇 분씩 걸려 연결이 끊긴다.
-    // 작은 청크로 나눠, "지금 보고 있는 지점" 주변부터 우선 번역해 바로 띄우고
-    // 나머지는 백그라운드로 채운다. 이웃 세그먼트는 문맥(CTX)으로 함께 보낸다.
-    // [실측 36요청, 실제 자막 4개 fixture: 수동 7.1초 / 자동 7.5초]
+    // 작은 청크로 나눠, "지금 보고 있는 지점"부터 번역해 바로 띄우고 나머지는
+    // 백그라운드로 채운다. 이웃 세그먼트는 문맥(CTX)으로 함께 보낸다.
+    //
+    // 지연은 출력 토큰이 만든다 — 조각이 적을수록 빨리 온다.
+    //   [실측 VBMUMuZBxw0, 재생 지점 부근 5회]
+    //     N=3  중앙 2.3초   N=4  3.1초   N=8  4.4초   N=12  5.9초
+    //     입력 토큰은 608→688 로 거의 안 변한다 (문맥이 대부분이라).
+    // 그래서 배경은 12조각으로 효율을 취하고, 지금 보고 있는 구간만 잘게 잘라
+    // 먼저 띄운다.
     const TRANSLATE_CHUNK = 12;
+    const PRIORITY_SLICE = 4;     // 재생 지점을 덮는 몇 조각을 먼저 번역할지
     state.perf.segsPerChunk = TRANSLATE_CHUNK;
     const CTX_N = 8;
-    const chunks = [];
+
+    /** 번역 작업 하나. segments 의 연속 구간이며, 시간 구간 [t0,t1] 을 소유한다.
+     *  구간이 서로 겹치지 않는 한 mergeTranslated 가 각자 자리만 교체한다. */
+    const mkJob = (i0, segs) =>
+      ({ i0, segs, t0: segs[0].start, t1: segs[segs.length - 1].end });
+
+    const pending = new Set();
     for (let i = 0; i < segments.length; i += TRANSLATE_CHUNK) {
-      const segs = segments.slice(i, i + TRANSLATE_CHUNK);
-      chunks.push({ i0: i, segs, t0: segs[0].start, t1: segs[segs.length - 1].end });
+      pending.add(mkJob(i, segments.slice(i, i + TRANSLATE_CHUNK)));
     }
-    // 우선순위는 고정 순서가 아니라 "매 청크마다" 현재 재생바 위치로 다시
+    let total = pending.size;
+
+    // 우선순위는 고정 순서가 아니라 "매 작업마다" 현재 재생바 위치로 다시
     // 고른다 — 시킹해도 다음 요청부터 그 지점이 최우선이 된다.
-    const pending = new Set(chunks);
-    const nextChunk = () => {
-      const t = $("video")?.currentTime || 0;
+    const playhead = () => $("video")?.currentTime || 0;
+    const isPlaying = (j, t) => t >= j.t0 - 5 && t <= j.t1;
+    const nextJob = () => {
+      const t = playhead();
       let best = null, bestScore = Infinity;
-      for (const c of pending) {
-        const s0 = c.segs[0].start, e0 = c.segs[c.segs.length - 1].end;
-        const sc = t >= s0 - 5 && t <= e0 ? -1        // 지금 재생 중인 청크 최우선
-          : s0 >= t ? s0 - t                          // 앞쪽은 가까운 순서
-          : 1e6 + (t - s0);                           // 지나간 쪽은 맨 뒤
-        if (sc < bestScore) { bestScore = sc; best = c; }
+      for (const j of pending) {
+        const sc = isPlaying(j, t) ? -1        // 지금 재생 중인 작업 최우선
+          : j.t0 >= t ? j.t0 - t               // 앞쪽은 가까운 순서
+          : 1e6 + (t - j.t0);                  // 지나간 쪽은 맨 뒤
+        if (sc < bestScore) { bestScore = sc; best = j; }
       }
-      return best;
+      return best && { j: best, playing: bestScore === -1 };
     };
+
+    /** 재생 중인 작업을 "지금 보는 몇 조각"과 나머지로 쪼갠다.
+     *  세 조각 모두 시간이 겹치지 않으므로 병합이 서로를 침범하지 않는다.
+     *  @returns {object|null} 먼저 번역할 조각. 쪼갤 필요가 없으면 null */
+    const splitForPlayhead = (j) => {
+      if (j.segs.length <= PRIORITY_SLICE) return null;
+      let p = j.segs.findIndex((s) => s.end >= playhead());
+      if (p < 0) p = 0;
+      const head = mkJob(j.i0 + p, j.segs.slice(p, p + PRIORITY_SLICE));
+      for (const rest of [j.segs.slice(0, p), j.segs.slice(p + PRIORITY_SLICE)]) {
+        if (rest.length) { pending.add(mkJob(j.i0 + j.segs.indexOf(rest[0]), rest)); total++; }
+      }
+      return head;
+    };
+
+    // 시킹하면 지금 보는 곳과 무관해진 요청을 끊는다. 안 끊으면 runner 8개가
+    // 옛 재생 위치 작업을 붙잡고 있어, 새 지점은 하나가 빌 때까지 기다린 뒤에야
+    // 발사된다 — 실측상 그것이 시킹 지연의 절반이었다 (9.2초 → 4.8초).
+    /** @type {Map<object, AbortController>} */
+    const inflight = new Map();
+    const onSeek = () => {
+      const t = playhead();
+      for (const [j, ctl] of inflight) if (!isPlaying(j, t)) ctl.abort();
+    };
+    $("video")?.addEventListener("seeked", onSeek);
+    cleanups.push(() => $("video")?.removeEventListener("seeked", onSeek));
 
     // showStatus 없음 — 원문이 이미 떠 있는데 덮어쓰면 I1 위반
     let done = 0, failed = 0;
-    const retried = new Set();     // 청크당 실패 재큐 1회 한정 (I5)
+    const retried = new Set();     // 작업당 실패 재큐 1회 한정 (I5)
     const runner = async () => {
       for (;;) {
         if (state.gen !== myGen || !state.active) return;   // I6
-        const c = nextChunk();
-        if (!c) return;
-        pending.delete(c);
+        const picked = nextJob();
+        if (!picked) return;
+        let { j, playing } = picked;
+        pending.delete(j);
+        if (playing) {
+          const head = splitForPlayhead(j);
+          if (head) j = head;
+        }
+        // 이 작업만 끊을 수 있는 손잡이. 세션 전체 중단(sig)과 함께 건다.
+        const ctl = new AbortController();
+        const onAbort = () => ctl.abort();
+        sig.addEventListener("abort", onAbort);
+        inflight.set(j, ctl);
         const tReq = performance.now();
         try {
-          const res = await requestTranslation(videoId, track.languageCode, c.segs, {
-            before: segments.slice(Math.max(0, c.i0 - CTX_N), c.i0).map((s) => s.text),
-            after: segments.slice(c.i0 + c.segs.length, c.i0 + c.segs.length + CTX_N).map((s) => s.text),
-          }, sig);
+          const res = await requestTranslation(videoId, track.languageCode, j.segs, {
+            before: segments.slice(Math.max(0, j.i0 - CTX_N), j.i0).map((s) => s.text),
+            after: segments.slice(j.i0 + j.segs.length, j.i0 + j.segs.length + CTX_N).map((s) => s.text),
+          }, ctl.signal);
           if (state.gen !== myGen || !state.active) return;   // I6
           // 두 배열은 같은 인덱스로 정렬된다 — 어긋나면 "이 지연이 이 토큰에서
-          // 나왔다"는 대응이 깨진다. usage 없는 청크는 0 이 아니라 null (해당 없음).
+          // 나왔다"는 대응이 깨진다. usage 없는 작업은 0 이 아니라 null (해당 없음).
           state.perf.chunkMs.push(Math.round(performance.now() - tReq));
           state.perf.tokens.push(res.usage?.completion_tokens ?? null);
-          mergeTranslated(res.lines, c.t0, c.t1);            // I2·I3·I4·I5·I23
+          mergeTranslated(res.lines, j.t0, j.t1);            // I2·I4·I5·I23
           done++;
           if (!state.perf.tFirstTrans) state.perf.tFirstTrans = performance.now() - state.perf.t0;
-          log(`번역 ${done}/${chunks.length} 청크 (${state.lines.length}줄)`);
+          log(`번역 ${done}/${total} (${state.lines.length}줄)`);
         } catch (e) {
           if (sig.aborted || state.gen !== myGen) return;     // 세션 종료는 실패가 아니다
-          if (!retried.has(c)) { retried.add(c); pending.add(c); continue; }
+          // 시킹으로 끊긴 작업은 실패가 아니다 — 그 자리로 돌아오면 다시 번역한다
+          if (ctl.signal.aborted) { pending.add(j); continue; }
+          if (!retried.has(j)) { retried.add(j); pending.add(j); continue; }
           failed++;
-          log(`번역 청크 실패 (${failed}번째)`, e.message);
+          log(`번역 작업 실패 (${failed}번째)`, e.message);
+        } finally {
+          inflight.delete(j);
+          sig.removeEventListener("abort", onAbort);
         }
       }
     };
@@ -1081,13 +1152,13 @@ async function start() {
     await Promise.all(Array.from({ length: RUNNERS }, runner));
     if (state.gen !== myGen || !state.active) return;   // I6
     if (!done) throw new Error("번역 실패");             // lines 는 raw 로 항상 차 있다 (I1)
-    if (failed) toast(`번역 ${failed}개 청크 실패`);
+    if (failed) toast(`번역 ${failed}개 구간 실패`);
     const p = state.perf;
     log(`준비 완료: ${state.lines.length}줄`, {
       tPlayer: Math.round(p.tPlayer), tSegs: Math.round(p.tSegs),
       tFirstPaint: Math.round(p.tFirstPaint), tFirstTrans: Math.round(p.tFirstTrans),
       chunkMedian: p.chunkMs.slice().sort((a, b) => a - b)[p.chunkMs.length >> 1],
-      tAllDone: Math.round(performance.now() - p.t0), chunks: chunks.length, failed,
+      tAllDone: Math.round(performance.now() - p.t0), jobs: total, failed,
       segsPerChunk: p.segsPerChunk,
       tokMedian: p.tokens.filter((t) => t != null).sort((a, b) => a - b)[p.tokens.length >> 1] ?? null,
     });
@@ -1104,6 +1175,7 @@ function stop({ keepBox = false } = {}) {
   if (state.rafId) cancelAnimationFrame(state.rafId);
   // 안 떼면 확장을 꺼도 유튜브 자막이 계속 숨겨진 채로 남는다
   document.documentElement.classList.remove("ytdual-on");
+  for (const fn of state.cleanups.splice(0)) { try { fn(); } catch {} }
   state.abort?.abort();   // I7: 진행 중인 요청을 실제로 끊는다
   state.gen++;            // I6: 이 세대의 남은 응답을 무효화
   Object.assign(state, { rafId: null, lines: [], idx: -1, loop: false, active: false, abort: null });

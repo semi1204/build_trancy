@@ -64,8 +64,13 @@ function validateOptions(options) {
       (host !== "youtube.com" && host !== "youtu.be")) {
     throw new Error("공개 HTTPS YouTube URL만 사용할 수 있습니다");
   }
-  if (!/^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$/.test(options.language || "")) {
-    throw new Error("--lang에는 en, en-orig, zh-Hans 같은 정확한 언어 코드 하나를 넣으세요");
+  // 밑줄을 허용하는 이유: 유튜브가 자막 트랙에 모델/버전 식별자를 붙이기 시작했다.
+  //   예) en-US-_5Vp3ULVrJE — yt-dlp 는 이것을 subtitles 의 키로 그대로 준다.
+  //   허용하지 않으면 그런 영상은 아예 수집할 수 없다.
+  // 와일드카드(*, all)는 계속 막는다. 여러 트랙을 받으면 어느 것을 fixture 로
+  //   삼았는지 불분명해지고, manifest 의 language 와 실제 파일이 어긋난다.
+  if (!/^[A-Za-z0-9_]+(?:-[A-Za-z0-9_]+)*$/.test(options.language || "")) {
+    throw new Error("--lang에는 en, en-orig, en-US-_5Vp3ULVrJE 같은 정확한 언어 코드 하나를 넣으세요");
   }
   if (options.transcriptOnly && options.secondsSpecified) {
     throw new Error("자막 전용 수집은 전체 자막을 저장하므로 --seconds를 사용할 수 없습니다");
