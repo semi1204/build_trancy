@@ -24,11 +24,16 @@ const EPILOGUE = `
   packToK,
   splitLine,
   splitTransToK,
-  fillUncovered,
+  groupSegments,
+  buildPayload,
   enforceShortLines,
   translateAll,
   MAX_LINE_CHARS,
   BATCH,
+  SYSTEM,
+  FAST_SYSTEM,
+  LLM_MODEL,
+  REASONING,
 };
 `;
 

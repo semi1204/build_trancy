@@ -156,34 +156,36 @@ partial phrase it is, using the surrounding fragments to resolve meaning.
 Output ONLY: {"t":["...","..."]} — one translation per input, same order, same count.
 No markdown fences, no commentary.`;
 
-const SYSTEM = (target) => `You merge broken YouTube caption fragments into natural subtitle lines and translate them for a language learner.
+/* full 등급. 과제는 "번역" 하나뿐이다.
+ *
+ * 옛 SYSTEM 은 병합 + 자막줄 분할 + 원문 재출력 + 번역을 한 번에 시켰다. 그
+ * 복잡도가 reasoning 을 만들고, reasoning 이 지연을 만들었다 — 지연은 출력
+ * 토큰에 거의 비례한다(W9).
+ *   [실측 N=12, 실제 자막: 옛 SYSTEM 은 자동생성 ja 에서 out 2478 / reasoning
+ *    1925 / 47.1초. 이 프롬프트는 out 204 / reasoning 0 / 5.2초]
+ *
+ * 무엇을 한 줄로 볼지는 모델이 아니라 우리가 정한다 — groupSegments 가 조각을
+ * 문장 끝·글자수·시간 간격으로 묶는다. 기계가 할 수 있는 일을 모델에게 시키면
+ * 값을 두 번 치른다: 느려지고, 결과가 매번 달라진다.
+ *
+ * 계약은 개수 일치 하나뿐이고 기계가 검사한다(W15). 그래서 줄 수를 프롬프트에
+ * 숫자로 박는다.
+ *
+ * W16: CONTEXT 는 번호 목록 밖의 별도 블록이다. 번호 없는 줄을 목록에 섞으면
+ *   모델이 그것까지 세어 개수가 밀린다.
+ *   [실측: CTX 를 목록에 섞었을 때 계약위반 3회 중 1~2회 → 분리 후 4회 중 0회] */
+const SYSTEM = (target, n) => `Translate subtitle lines into natural ${target}.
 
-Work in two steps:
-1) MERGE: join fragments into complete sentences with proper punctuation.
-   Fragments are cut mid-sentence at random points — a fragment boundary
-   means nothing. Never end a line just because a fragment ended.
-2) SPLIT into subtitle lines:
-   - A sentence of up to ~14 words is ONE line. Never put two sentences in one line.
-   - A longer sentence becomes several lines of ~5-12 words, each split at a
-     clause boundary (comma, conjunction, relative clause) so every line is a
-     coherent phrase. Never end a line on a dangling subject, article, or
-     preposition ("... so I" is wrong; break before "so").
-   - A very short interjection ("Yeah.", "[sighs]") joins the adjacent line.
-   - A trailing conjunction or discourse marker ("So,", "And", "But") STARTS
-     the next line — it never ends a line.
+You will get ${n} numbered lines to translate, and optionally CONTEXT blocks.
+CONTEXT is background only — never translate or count it.
 
-Rules:
-- Lines starting with "CTX-" (preceding) or "CTX+" (following) are surrounding
-  context only. Use them so the translation connects naturally across chunk
-  boundaries, but NEVER output lines for them — indices cover only the
-  numbered fragments.
-- Use the surrounding context: resolve pronouns and dropped subjects so each line reads naturally on its own.
-- Never invent, omit, summarize, or reorder content.
-- "s" = index of the FIRST source fragment a line covers, "e" = index of the LAST.
-- Indices must be non-decreasing and must cover every fragment exactly once.
-- "o" = cleaned original text with proper punctuation and capitalization.
-- "t" = natural translation into ${target}. Translate meaning, not word-for-word. Keep proper nouns and technical terms.
-- Output ONLY: {"lines":[{"s":0,"e":1,"o":"...","t":"..."}]}
+- Translate meaning, not word-for-word. Keep proper nouns and technical terms.
+- Use the context so pronouns and dropped subjects read naturally.
+- A line may be cut mid-sentence. Translate it as the partial phrase it is;
+  do not complete it, do not borrow words from the next line.
+- Do not merge, split, reorder, add, or omit anything.
+
+Output ONLY: {"t":[...]} with exactly ${n} strings, in the same order.
 No markdown fences, no commentary.`;
 
 const CORS = {
@@ -207,6 +209,67 @@ async function sha1(str) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/* ── 조각 묶기 ───────────────────────────────────────────────────────
+ * 유튜브 자막 조각은 문장 중간에서 끊긴다. 그걸 그대로 한 줄씩 번역하면 뜻이
+ * 안 통하고, 모델에게 병합까지 시키면 느려진다(위 SYSTEM 주석). 그래서 기계가
+ * 묶는다 — 규칙이 넷뿐이라 결정적이고, LLM 없이 테스트할 수 있다.
+ *
+ * 묶은 단위가 곧 화면의 한 줄이다. 그래서 한도를 MAX_LINE_CHARS 에 맞춘다.
+ * 이 한도 안에서 만들어지므로 splitLine 이 거의 걸리지 않는다 — 걸리면 원문과
+ * 번역의 절 경계가 어긋나므로(W19) 안 걸리는 편이 낫다. */
+const MIN_GROUP_CHARS = 15;  // 이보다 짧은 묶음은 이웃에 붙인다 (토막 번역 방지)
+const GROUP_MAX_GAP = 1.2;   // 이보다 벌어지면 화면 전환·침묵으로 본다
+const GROUP_MAX_SECS = 8;    // 한 줄이 이보다 오래 머무르면 읽는 리듬이 깨진다
+const SENTENCE_END = /[.!?…。？！]["'”’)\]]?$/;
+// 일본어·중국어는 띄어쓰기가 없다. 조각을 공백으로 이으면 없던 공백이 생겨
+// 단어가 갈라진다 ("お話を聞いてみ" + "たいと思い" → "…みたいと" 사이에 공백).
+// 한글(\uac00-\ud7af)은 띄어쓰기를 쓰므로 제외한다.
+// [실측 13 fixture: CJK 경계에서 이어붙이는 지점 10곳]
+const CJK = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/;
+const joinText = (a, b) =>
+  CJK.test(a.slice(-1)) || CJK.test(b[0] ?? "") ? a + b : `${a} ${b}`;
+
+/**
+ * @param {{start:number,end:number,text:string}[]} segs  start 오름차순
+ * @returns {{start:number,end:number,text:string,from:number,to:number}[]}
+ *   from/to 는 segs 에서의 인덱스 범위(양끝 포함). 모든 조각이 정확히 한 묶음에
+ *   들어간다 — 이 성질이 응답 커버리지를 보장한다(구멍이 원천적으로 안 생긴다).
+ */
+function groupSegments(segs) {
+  const out = [];
+  let cur = null;
+  for (let i = 0; i < segs.length; i++) {
+    const s = segs[i];
+    if (!cur) { cur = { start: s.start, end: s.end, text: s.text, from: i, to: i }; continue; }
+    const joined = joinText(cur.text, s.text);
+    // 아주 짧은 조각은 혼자 두지 않는다. "Bien," 한 줄이 "그런데 이" 같은 토막
+    // 번역을 낳는다. 옛 SYSTEM 도 같은 규칙을 문장으로 갖고 있었다
+    // ("A very short interjection joins the adjacent line").
+    // [실측 13 fixture: 15자 미만 묶음이 66/1894 = 3.5%]
+    const tiny = cur.text.length < MIN_GROUP_CHARS;
+    const cap = tiny ? MAX_LINE_CHARS + 15 : MAX_LINE_CHARS;
+    const breakHere =
+      (SENTENCE_END.test(cur.text) && !tiny) ||    // 앞이 문장으로 끝났다
+      joined.length > cap ||                       // 자막 한 줄로 읽기엔 길다
+      s.start - cur.end > GROUP_MAX_GAP ||         // 침묵이 있었다
+      s.end - cur.start > GROUP_MAX_SECS;          // 너무 오래 붙잡는다
+    if (breakHere) { out.push(cur); cur = { start: s.start, end: s.end, text: s.text, from: i, to: i }; }
+    else { cur.text = joined; cur.end = s.end; cur.to = i; }
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
+/** 번역할 줄과 문맥을 프롬프트 본문으로 만든다.
+ *  CONTEXT 를 번호 목록 밖에 두는 것이 핵심이다 (W16). */
+function buildPayload(lines, ctxB, ctxA) {
+  const parts = [];
+  if (ctxB.length) parts.push(`CONTEXT BEFORE:\n${ctxB.join("\n")}`);
+  if (ctxA.length) parts.push(`CONTEXT AFTER:\n${ctxA.join("\n")}`);
+  parts.push(`TRANSLATE THESE ${lines.length} LINES:\n${lines.map((l, i) => `${i}: ${l.text}`).join("\n")}`);
+  return parts.join("\n\n");
+}
+
 // ── 번역 ─────────────────────────────────────────────────────────────
 /**
  * 목표 계약 (Phase 6 에서 구현).
@@ -218,49 +281,15 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  *   usage 는 상류 응답의 것을 그대로 통과시킨다. 상류가 안 주면 필드 자체가 없다
  *   (0 으로 채우지 않는다 — "측정 안 됨"과 "0 토큰"은 다른 사실이다).
  */
-/** 모델이 빠뜨린 조각을 원문 그대로 끼워 넣는다. out 을 제자리에서 고친다.
- *
- *  불변식 W20: 응답은 batch 의 모든 조각을 덮어야 한다. SYSTEM 프롬프트가
- *    "cover every fragment exactly once" 를 요구하지만 모델은 가끔 어긴다 —
- *    특히 "00:43 DEREK" 같은 자막 부산물을 노이즈로 보고 버린다.
- *    [실측: 24요청 중 1건. gIwvFMiJNVU 의 마지막 조각이 빠져 1.00초가 비었다]
- *
- *  왜 그냥 두면 안 되나 — mergeTranslated 는 청크 구간 [t0,t1] 의 raw 줄을 지우고
- *    응답으로 갈아끼운다. 응답이 그 구간을 다 안 덮으면 지워진 자리가 그대로
- *    빈 시각이 된다 (I5 위반: 화면에 아무것도 없는 순간).
- *
- *  번역 없이 원문만 넣는 이유 — 없는 번역을 지어낼 수는 없다. 원문이라도 보이는
- *    편이 아무것도 없는 것보다 낫다. 화면이 비는 것은 언제나 최악이다. */
-function fillUncovered(batch, out) {
-  const covered = new Uint8Array(batch.length);
-  for (const l of out) for (let i = l.s; i <= l.e; i++) covered[i] = 1;
-  let added = false;
-  for (let i = 0; i < batch.length; i++) {
-    if (covered[i]) continue;
-    out.push({
-      s: i, e: i,
-      start: batch[i].start, end: batch[i].end,
-      orig: batch[i].text, trans: "",
-    });
-    added = true;
-  }
-  // 아래 글자수 비례 분할이 "같은 (s,e) 가 연속으로 붙어 있다"를 전제하므로
-  // 끼워 넣었으면 인덱스 순서를 되돌려야 한다. sort 는 안정 정렬이라 같은 s 의
-  // 원래 순서(모델이 낸 순서)는 보존된다.
-  if (added) out.sort((a, b) => a.s - b.s || a.e - b.e);
-  return out;
-}
-
 async function translateBatch(env, batch, target, ctxB = [], ctxA = [], mode = "full") {
   const fast = mode === "fast";
-  const numbered = batch.map((s, i) => `${i}: ${s.text}`).join("\n");
-  // W16: fast 에는 CTX 를 붙이지 않는다. 번호 없는 줄이 개수를 밀리게 한다.
+  // full 은 조각을 먼저 묶는다 — 묶은 단위가 곧 화면의 한 줄이고, 모델의 과제는
+  // 그것을 번역하는 것뿐이다. fast 는 미리보기라 조각 그대로 1:1 이다.
+  const units = fast ? batch : groupSegments(batch);
   const payload = fast
-    ? numbered
-    : ctxB.map((t) => `CTX-: ${t}`).join("\n") +
-      (ctxB.length ? "\n" : "") +
-      numbered +
-      (ctxA.length ? "\n" + ctxA.map((t) => `CTX+: ${t}`).join("\n") : "");
+    // W16: fast 에는 CTX 를 붙이지 않는다. 번호 없는 줄이 개수를 밀리게 한다.
+    ? batch.map((s, i) => `${i}: ${s.text}`).join("\n")
+    : buildPayload(units, ctxB, ctxA);
 
   let lastUsage;
 
@@ -284,7 +313,7 @@ async function translateBatch(env, batch, target, ctxB = [], ctxA = [], mode = "
           reasoning: { effort: fast ? "none" : REASONING },
           response_format: { type: "json_object" },
           messages: [
-            { role: "system", content: fast ? FAST_SYSTEM(target) : SYSTEM(target) },
+            { role: "system", content: fast ? FAST_SYSTEM(target) : SYSTEM(target, units.length) },
             { role: "user", content: payload },
           ],
         }),
@@ -315,47 +344,19 @@ async function translateBatch(env, batch, target, ctxB = [], ctxA = [], mode = "
         };
       }
 
-      const out = [];
-
-      for (const ln of parsed.lines || []) {
-        const s = Math.max(0, Math.min(Number(ln.s) | 0, batch.length - 1));
-        const e = Math.max(s, Math.min(Number(ln.e) | 0, batch.length - 1));
-        const orig = String(ln.o ?? "").trim();
-        if (!orig) continue;
-        out.push({
-          s,
-          e,
-          start: batch[s].start,
-          end: batch[e].end,
-          orig,
-          trans: String(ln.t ?? "").trim(),
-        });
+      // full 도 계약은 개수 하나뿐이다. 묶음이 곧 줄이므로 인덱스가 밀릴 여지가
+      // 없고, 커버리지는 groupSegments 가 전 조각을 분할하므로 구조적으로 보장된다
+      // (옛 s/e 방식은 모델이 조각을 빠뜨려 화면이 비는 사고가 실제로 났다 — W20).
+      const t = parsed.t;
+      if (!Array.isArray(t) || t.length !== units.length) {
+        throw new Error(`full 길이 불일치 ${t?.length}/${units.length}`);
       }
-      fillUncovered(batch, out);
-      // 같은 fragment 구간을 여러 줄로 쪼갠 경우 시간도 글자수 비례로 나눈다
-      // (안 나누면 start 가 같아져 앞줄이 표시되지 않는다)
-      let i = 0;
-      while (i < out.length) {
-        let j = i;
-        while (j + 1 < out.length && out[j + 1].s === out[i].s && out[j + 1].e === out[i].e) j++;
-        if (j > i) {
-          const t0 = out[i].start, t1 = out[i].end;
-          const total = out.slice(i, j + 1).reduce((n, l) => n + l.orig.length, 0) || 1;
-          let acc = 0;
-          for (let k = i; k <= j; k++) {
-            out[k].start = t0 + ((t1 - t0) * acc) / total;
-            acc += out[k].orig.length;
-            out[k].end = t0 + ((t1 - t0) * acc) / total;
-          }
-        }
-        i = j + 1;
-      }
-      if (out.length) {
-        return {
-          lines: out.map(({ s, e, ...rest }) => rest),
-          ...(lastUsage ? { usage: lastUsage } : {}),
-        };
-      }
+      return {
+        lines: units.map((u, i) => ({
+          start: u.start, end: u.end, orig: u.text, trans: String(t[i] ?? "").trim(),
+        })),
+        ...(lastUsage ? { usage: lastUsage } : {}),
+      };
     } catch {
       if (attempt === attempts - 1) break;
       await sleep(500 * 2 ** attempt);
@@ -374,8 +375,9 @@ async function translateBatch(env, batch, target, ctxB = [], ctxA = [], mode = "
   if (fast) {
     return { t: batch.map(() => ""), degraded: true, ...(lastUsage ? { usage: lastUsage } : {}) };
   }
+  // full 포기: 묶은 단위의 원문만 낸다. 번역은 비지만 화면은 비지 않는다 (I5).
   return {
-    lines: batch.map((s) => ({ start: s.start, end: s.end, orig: s.text, trans: "" })),
+    lines: units.map((u) => ({ start: u.start, end: u.end, orig: u.text, trans: "" })),
     degraded: true,
     ...(lastUsage ? { usage: lastUsage } : {}),
   };
@@ -708,14 +710,14 @@ async function handleSubtitle(request, env, ctx) {
   const fingerprint = await sha1(
     [...ctxB, "\u0002", ...segments.map((s) => s.text), "\u0002", ...ctxA].join("\u0001")
   );
-  // v8 (W2·W19): splitLine 이 번역을 잃지 않도록 고쳤다. v7 캐시에는 꼬리가 빈 줄이
-  //   그대로 들어 있고, 그건 tier:"full" 로 찍혀 applyFast 가 영영 못 채운다.
-  //   버전을 안 올리면 고친 코드가 옛 빈칸을 계속 서빙해 수정이 없던 일이 된다.
+  // v9 (W2): full 이 "묶은 단위 1:1 번역"으로 바뀌어 줄의 경계와 원문 문자열이
+  //   달라졌다. v8 캐시는 모델이 병합·정리한 원문을 담고 있어 섞이면 안 된다.
+  // v8 (W19): splitLine 이 번역 꼬리를 잃던 것을 고쳤을 때.
   // v7: LLM_MODEL 을 luna → terra 로 바꿨을 때.
   // mode (W13): 안 넣으면 같은 조각의 fast 요청과 full 요청이 같은 키가 된다. 먼저
   //   저장된 fast 결과(문자열 배열)가 full 요청에 나가고, 확장은 lines 를 기대하다
   //   빈 응답으로 처리한다 — 그 구간은 영영 정확한 번역을 못 받는다.
-  const key = `sub:v8:${mode}:${videoId}:${lang}:${target}:${fingerprint.slice(0, 12)}`;
+  const key = `sub:v9:${mode}:${videoId}:${lang}:${target}:${fingerprint.slice(0, 12)}`;
 
   // 불변식 W2: 위 키의 버전(sub:vN)은 출력 줄 형태가 바뀔 때마다 올려야 한다.
   //   Phase 4 실측 — 캐시 히트는 0.0초(미스 대비 약 2만배)라 이 경로가 사실상 전부다.

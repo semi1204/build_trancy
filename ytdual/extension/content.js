@@ -62,14 +62,21 @@ const DEFAULTS = {
  *  I8  abort signal 은 start() 진입 시 지역 변수로 캡처한다. stop() 이 state.abort 를
  *      null 로 만들기 때문에, runner 가 나중에 state.abort.signal 을 읽으면 터진다.
  *
- * 지연 예산 (실측. 모든 항이 이 값에 비례한다)
- *   실제 자막 4개 fixture × 3위치, gpt-5.6-terra, 캐시 미스, 순차 60요청:
- *     fast N=8   수동 4.4초 / 자동 5.9초   (reasoning 수동 0, 자동 134)
- *     full N=8   수동 14.7초 / 자동 17.6초
- *     full N=12  수동 22.5초 / 자동 18.5초
- *   같은 N=8 에서 fast 는 full 의 1/3 이다 — 등급 분리는 실제로 값을 한다.
- *   ★ 옛 주석의 "왕복 70~100초"는 luna 시절 값이라 폐기했다. 아래 I12 도 그 숫자에
- *     기대고 있었으므로 함께 다시 잡아야 한다.
+ * 지연 예산 (실측. 지연은 출력 토큰에 거의 비례한다)
+ *   실제 자막 4개 fixture × 3위치, gpt-5.6-terra, 캐시 미스, 순차 36요청:
+ *     fast N=8   수동 4.1초 / 자동 4.9초
+ *     full N=8   수동 3.9초 / 자동 7.3초
+ *     full N=12  수동 7.1초 / 자동 7.5초
+ *
+ *   ★ 워커가 full 프롬프트에서 병합·분할·원문재출력을 걷어내고 "번역"만 남긴 뒤의
+ *     값이다. 그 전에는 full N=12 가 수동 22.5초 / 자동 18.5초였다(자동 ja 는 47초).
+ *     복잡한 과제가 reasoning 을 만들고 reasoning 이 지연을 만든다 — 조각을 무엇으로
+ *     묶을지는 워커의 groupSegments 가 기계적으로 정한다.
+ *
+ *   ★★ 그 결과 fast 와 full 의 지연 차이가 사실상 사라졌다(3.9 vs 4.1초). 거리 기반
+ *     2단(I16~I18·I21, previewed, fastWindow, applyFast, tier)은 full 이 20초대일 때
+ *     필요했던 장치다. 계속 둘지는 다시 판단해야 한다 — 지금은 fast 가 요청 하나를
+ *     더 쓰면서 품질만 낮춘다.
  *   재현: node scripts/bench-translation.mjs  (워커 + CLIProxyAPI 필요)
  *  I9  청크 하나의 크리티컬 패스에 LLM 왕복은 1회 이하다.               [실측]
  *  I10 모든 fetch 는 유한한 타임아웃을 가진다. 무기한 대기는 runner 슬롯을
@@ -1125,11 +1132,12 @@ async function start() {
     // 나머지는 백그라운드로 채운다. 이웃 세그먼트는 문맥(CTX)으로 함께 보낸다.
     // 두 격자는 정렬될 필요가 없다 — fast 는 시각으로 제자리 대입하고(I22) full 은
     // 시간 구간을 교체하므로, 서로 다른 크기여도 안전하다.
-    // [실측 60요청, 실제 자막 4개 fixture. 수동/자동 = 사람이 단 자막 / 자동생성 자막]
-    const TRANSLATE_CHUNK = 12;   // full 격자.       [수동 22.5초 / 자동 18.5초]
-    const FAST_CHUNK = 8;         // 재생 중 미리보기. [수동 4.4초 / 자동 5.9초]
-    // 같은 N=8 로 재면 full 은 14.7/17.6초 — fast 가 3배 빠르다. 크기가 아니라
-    // 등급(프롬프트·reasoning)이 만드는 차이다.
+    // [실측 36요청, 실제 자막 4개 fixture. 수동/자동 = 사람이 단 자막 / 자동생성 자막]
+    const TRANSLATE_CHUNK = 12;   // full 격자.       [수동 7.1초 / 자동 7.5초]
+    const FAST_CHUNK = 8;         // 재생 중 미리보기. [수동 4.1초 / 자동 4.9초]
+    // 같은 N=8 이면 full 이 3.9초로 오히려 fast(4.1초)보다 빠르다. 워커가 full
+    // 프롬프트를 "번역"만 남기고 단순화한 뒤로 등급 차이가 사라졌다 — 위 지연 예산의
+    // ★★ 참조. fast 를 계속 둘 이유가 남아 있는지 다시 봐야 한다.
     state.perf.segsPerChunk = TRANSLATE_CHUNK;
     const CTX_N = 8;
     const chunks = [];
