@@ -925,10 +925,37 @@ function makeJob(i0, segs) {
   return { i0, segs, t0: segs[0].start, t1: segs[segs.length - 1].end };
 }
 
-/** segments 를 size 조각씩 잘라 작업 목록을 만든다. @returns {Job[]} */
+/* 작업 경계를 문장 끝에 맞추는 데 쓴다. 워커의 SENTENCE_END 와 같은 규칙이다 —
+ * 파일이 갈라져 있어 상수를 공유할 수 없으므로 둘을 함께 고쳐야 한다. */
+const JOB_SENTENCE_END = /[.!?…。？！]["'”’)\]]?$/;
+
+/**
+ * segments 를 size 조각씩 잘라 작업 목록을 만든다.
+ *
+ * 정확히 size 로 자르지 않고 문장 끝에 맞춘다. 작업 경계가 문장 중간을 자르면
+ * 그 줄의 번역이 반쪽 난다 — 워커는 작업 안에서만 묶을 수 있어 경계 너머를 못 본다.
+ *   [실측 VBMUMuZBxw0: 아무 데서나 잘린 묶음 351개 중 146개(42%)가 작업 경계였다]
+ * size 의 ±40% 안에서 가장 가까운 문장 끝을 찾고, 없으면 원래 자리에서 자른다.
+ *
+ * @returns {Job[]} segments 를 빈틈없이, 겹치지 않게 덮는다
+ */
 function makeJobs(segments, size) {
   const jobs = [];
-  for (let i = 0; i < segments.length; i += size) jobs.push(makeJob(i, segments.slice(i, i + size)));
+  const near = Math.max(1, Math.round(size * 0.4));
+  let i = 0;
+  while (i < segments.length) {
+    let end = Math.min(i + size, segments.length);
+    if (end < segments.length) {
+      for (let d = 0; d <= near; d++) {
+        const cands = d === 0 ? [i + size] : [i + size - d, i + size + d];
+        const hit = cands.find((c) =>
+          c > i && c <= segments.length && JOB_SENTENCE_END.test(segments[c - 1].text));
+        if (hit) { end = hit; break; }
+      }
+    }
+    jobs.push(makeJob(i, segments.slice(i, end)));
+    i = end;
+  }
   return jobs;
 }
 

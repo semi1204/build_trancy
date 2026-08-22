@@ -153,15 +153,25 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 /* ── 조각 묶기 ───────────────────────────────────────────────────────
  * 유튜브 자막 조각은 문장 중간에서 끊긴다. 그걸 그대로 한 줄씩 번역하면 뜻이
  * 안 통하고, 모델에게 병합까지 시키면 느려진다(위 SYSTEM 주석). 그래서 기계가
- * 묶는다 — 규칙이 넷뿐이라 결정적이고, LLM 없이 테스트할 수 있다.
+ * 묶는다 — 규칙이 적어 결정적이고, LLM 없이 테스트할 수 있다.
+ *
+ * 묶는 단위는 "문장"이다. 조각이 아니다. 조각 경계는 문장과 아무 관계가 없고,
+ * 한 조각 안에 문장 끝과 다음 문장 시작이 섞여 있다:
+ *     "Kimmy Claude"  /  "is a bitch. You can access real faucet"  /  "for me."
+ * 조각 단위로 묶으면 "…real faucet" 에서 끊겨 "…접속할 수 있어" + "나 대신." 이
+ * 된다. 한국어는 어순이 달라(SOV) 영어를 중간에서 자르면 조각들이 이어지지 않는다.
+ *   [실측 15 fixture: 조각 단위로 묶었을 때 묶음의 61% 가 문장 도중에 끝났다.
+ *    자동생성 자막은 99~100%]
  *
  * 묶은 단위가 곧 화면의 한 줄이다. 그래서 한도를 MAX_LINE_CHARS 에 맞춘다.
  * 이 한도 안에서 만들어지므로 splitLine 이 거의 걸리지 않는다 — 걸리면 원문과
  * 번역의 절 경계가 어긋나므로(W19) 안 걸리는 편이 낫다. */
 const MIN_GROUP_CHARS = 15;  // 이보다 짧은 "미완결" 조각은 이웃에 붙인다
 const GROUP_MAX_GAP = 1.2;   // 이보다 벌어지면 화면 전환·침묵으로 본다
-const GROUP_MAX_SECS = 8;    // 한 줄이 이보다 오래 머무르면 읽는 리듬이 깨진다
+const MIN_UNIT_SECS = 1.5;   // 이보다 짧게 스쳐 지나가면 읽을 수 없다
 const SENTENCE_END = /[.!?…。？！]["'”’)\]]?$/;
+// 문장 경계에서 쪼갤 때 쓰는 것. SENTENCE_END 와 같은 문장부호 뒤의 공백을 찾는다.
+const SENTENCE_SPLIT = /(?<=[.!?…。？！]["'”’)\]]?)\s+/;
 // [MUSIC PLAYING], [음악], (笑) 같은 지문은 그 자체로 완결된 한 줄이다. 문장부호로
 // 끝나지 않아 SENTENCE_END 에 안 걸리므로 따로 본다. 안 그러면 다음 대사에 붙어
 // "[MUSIC PLAYING] [APPLAUSE] SUNDAR PICHAI: Hello, everyone." 같은 줄이 나온다.
@@ -174,39 +184,61 @@ const CJK = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/;
 const joinText = (a, b) =>
   CJK.test(a.slice(-1)) || CJK.test(b[0] ?? "") ? a + b : `${a} ${b}`;
 
+/** 조각 안에 문장이 여러 개 들어 있으면 문장마다 쪼갠다. 시간은 글자수 비례로
+ *  나눈다 — 조각 하나가 덮던 구간을 그대로 채우므로 시간에 구멍이 생기지 않는다.
+ *  @returns {{start:number,end:number,text:string}[]} 시간순, 서로 겹치지 않음 */
+function splitBySentence(segs) {
+  const out = [];
+  for (const s of segs) {
+    const parts = String(s.text).split(SENTENCE_SPLIT).map((x) => x.trim()).filter(Boolean);
+    if (parts.length <= 1) { out.push({ start: s.start, end: s.end, text: s.text }); continue; }
+    const total = parts.reduce((n, p) => n + p.length, 0) || 1;
+    const dur = s.end - s.start;
+    let acc = 0;
+    for (const p of parts) {
+      const start = s.start + (dur * acc) / total;
+      acc += p.length;
+      out.push({ start, end: s.start + (dur * acc) / total, text: p });
+    }
+  }
+  return out;
+}
+
 /**
  * @param {{start:number,end:number,text:string}[]} segs  start 오름차순
- * @returns {{start:number,end:number,text:string,from:number,to:number}[]}
- *   from/to 는 segs 에서의 인덱스 범위(양끝 포함). 모든 조각이 정확히 한 묶음에
- *   들어간다 — 이 성질이 응답 커버리지를 보장한다(구멍이 원천적으로 안 생긴다).
+ * @returns {{start:number,end:number,text:string}[]}
+ *   묶음들은 입력이 덮던 시간을 빈틈없이 이어서 덮는다. 이 성질이 응답 커버리지를
+ *   보장한다 — mergeTranslated 가 구간을 통째로 교체하므로 틈이 있으면 화면이 빈다.
  */
 function groupSegments(segs) {
+  const pieces = splitBySentence(segs);
   const out = [];
   let cur = null;
-  for (let i = 0; i < segs.length; i++) {
-    const s = segs[i];
-    if (!cur) { cur = { start: s.start, end: s.end, text: s.text, from: i, to: i }; continue; }
+  for (const s of pieces) {
+    if (!cur) { cur = { start: s.start, end: s.end, text: s.text }; continue; }
     const joined = joinText(cur.text, s.text);
     // 완결된 줄은 짧아도 혼자 둔다. "Good morning." 은 토막이 아니라 문장이고,
     // 사람이 일부러 한 줄로 끊은 것이다. 붙이면 한 줄에 문장이 둘 이상 들어간다.
-    //   [실측: 흡수 규칙에 문장 예외가 없던 동안 사람 자막에서
-    //    "[MUSIC PLAYING] [APPLAUSE AND CHEERING] SUNDAR PICHAI: Hello, everyone." 처럼
-    //    별개 이벤트 셋이 한 줄로 뭉쳤다]
     // 지문은 앞에서도 뒤에서도 끊는다. 뒤만 보면 "…없이 [clears throat]" 처럼
     // 앞 조각에 먼저 흡수돼 버려 CUE_ONLY 가 걸릴 기회조차 없다.
     const complete = SENTENCE_END.test(cur.text) || CUE_ONLY.test(cur.text) || CUE_ONLY.test(s.text);
     // 미완결인데 아주 짧은 조각만 이웃에 붙인다. "Bien," 한 줄은 "그런데 이" 같은
     // 토막 번역을 낳는다 — 그건 문장이 아니라 잘린 조각이다.
-    // [실측 13 fixture: 15자 미만 묶음이 66/1894 = 3.5%]
     const tiny = !complete && cur.text.length < MIN_GROUP_CHARS;
     const cap = tiny ? MAX_LINE_CHARS + 15 : MAX_LINE_CHARS;
+    // 한 줄에 문장이 여럿 들어가도 된다 — 끝이 문장 경계이기만 하면 번역이 온전하다.
+    // 그래서 완결됐어도 너무 짧으면 다음 문장을 더 받는다. 빠른 대화에서
+    // "오, 좋아." "좋아." "고마워." 가 0.3~0.6초씩 스쳐 지나가면 읽을 수 없다.
+    //   [실측 VBMUMuZBxw0: 이 규칙이 없을 때 묶음의 18% 가 1초 미만, 6% 가 0.5초 미만]
+    // 이것이 옛 결함과 다른 점이다. 옛 코드는 조각 중간의 문장 경계를 못 봐서
+    // 묶음이 문장 도중에 끝났다(61%). 지금은 끝이 항상 문장 경계다.
+    const longEnough = cur.end - cur.start >= MIN_UNIT_SECS;
     const breakHere =
-      complete ||                                  // 앞이 문장이나 지문으로 끝났다
+      (complete && longEnough) ||                  // 문장으로 끝났고 읽을 만큼 머물렀다
       joined.length > cap ||                       // 자막 한 줄로 읽기엔 길다
-      s.start - cur.end > GROUP_MAX_GAP ||         // 침묵이 있었다
-      s.end - cur.start > GROUP_MAX_SECS;          // 너무 오래 붙잡는다
-    if (breakHere) { out.push(cur); cur = { start: s.start, end: s.end, text: s.text, from: i, to: i }; }
-    else { cur.text = joined; cur.end = s.end; cur.to = i; }
+      s.start - cur.end > GROUP_MAX_GAP;           // 침묵이 있었다
+    if (breakHere) { out.push(cur); cur = { start: s.start, end: s.end, text: s.text }; }
+    else { cur.text = joined; cur.end = s.end; }
   }
   if (cur) out.push(cur);
   return out;

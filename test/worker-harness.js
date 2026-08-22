@@ -25,6 +25,7 @@ const EPILOGUE = `
   splitLine,
   splitTransToK,
   groupSegments,
+  splitBySentence,
   buildPayload,
   enforceShortLines,
   translateAll,

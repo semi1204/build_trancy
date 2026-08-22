@@ -142,3 +142,62 @@ test("★ 실제 자막에서도 쪼갠 구간이 겹치지 않는다", { skip }
     }
   }
 });
+
+/* ── 작업 경계를 문장 끝에 맞추는가 ─────────────────────────────────
+ * 작업 경계가 문장 중간을 자르면 그 줄의 번역이 반쪽 난다. 워커는 작업 안에서만
+ * 묶을 수 있어 경계 너머를 못 보기 때문이다.
+ *   [실측 VBMUMuZBxw0: 아무 데서나 잘린 묶음 351개 중 146개(42%)가 작업 경계였다.
+ *    맞춘 뒤 그냥 잘림 13% → 9%]
+ */
+const ENDS = (t) => /[.!?…。？！]["'”’)\]]?$/.test(t);
+
+test("★ 작업 경계를 문장 끝에 맞춘다", () => {
+  // 12조각에서 자르면 문장 중간이지만, 10조각에서 자르면 문장 끝이다
+  const s = Array.from({ length: 24 }, (_, i) => ({
+    start: i * 3, end: i * 3 + 3,
+    text: i === 9 || i === 19 ? `piece ${i}.` : `piece ${i}`,
+  }));
+  const jobs = y.makeJobs(s, CHUNK);
+  assert.ok(ENDS(jobs[0].segs.at(-1).text),
+    `문장 끝에 안 맞췄다: "${jobs[0].segs.at(-1).text}"`);
+  assert.equal(jobs[0].segs.length, 10);
+});
+
+test("가까운 문장 끝이 없으면 원래 자리에서 자른다", () => {
+  const s = Array.from({ length: 24 }, (_, i) => ({ start: i * 3, end: i * 3 + 3, text: `piece ${i}` }));
+  const jobs = y.makeJobs(s, CHUNK);
+  assert.equal(jobs[0].segs.length, CHUNK);
+});
+
+test("★ 경계를 옮겨도 빠짐없이·겹치지 않게 덮는다", () => {
+  for (const density of [0, 3, 5, 7]) {          // 문장 끝이 드물거나 잦은 경우 모두
+    const s = Array.from({ length: 100 }, (_, i) => ({
+      start: i * 3, end: i * 3 + 3,
+      text: density && i % density === 0 ? `piece ${i}.` : `piece ${i}`,
+    }));
+    const jobs = y.makeJobs(s, CHUNK);
+    let expect = 0;
+    for (const j of jobs) {
+      assert.equal(j.i0, expect, `밀도 ${density}: 틈이나 겹침`);
+      assert.ok(j.segs.length > 0);
+      expect += j.segs.length;
+    }
+    assert.equal(expect, s.length, `밀도 ${density}: 조각이 빠졌다`);
+  }
+});
+
+test("★ 실제 자막에서도 작업이 빈틈없이 이어진다", { skip }, () => {
+  for (const fx of FIXTURES) {
+    const s = y.normalizeSegments(fx.segments, fx.durationSeconds);
+    const jobs = y.makeJobs(s, CHUNK);
+    let expect = 0;
+    for (const j of jobs) {
+      assert.equal(j.i0, expect, `${fx.id}: 틈이나 겹침`);
+      expect += j.segs.length;
+    }
+    assert.equal(expect, s.length, `${fx.id}: 조각이 빠졌다`);
+    // 작업 크기가 통제 범위 안인가 — 무한정 커지면 지연이 돌아온다
+    const max = Math.max(...jobs.map((j) => j.segs.length));
+    assert.ok(max <= Math.round(CHUNK * 1.4), `${fx.id}: 작업이 ${max}조각까지 커졌다`);
+  }
+});
