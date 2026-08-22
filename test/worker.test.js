@@ -5,7 +5,7 @@
  *
  * 번역 "내용"은 검사하지 않는다. 모델이 바뀌면 문장이 바뀌므로 내용에 걸면
  * 테스트가 모델 버전에 묶여 쓸모없어진다. 검사하는 것은 계약뿐이다 —
- * 응답 길이, t/lines 배타성, 캐시 분리, 거절 조건.
+ * 구간 커버리지, 빈 번역 없음, 캐시, 거절 조건.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -61,62 +61,56 @@ async function post(body) {
   return { res, json, ms: +(performance.now() - t0).toFixed(0) };
 }
 
-test("W18 — fast 는 요청한 조각 수와 같은 길이의 t 를 준다", { skip }, async (t) => {
-  const s = segs(8, `fastlen-${nonce}`);
-  const { res, json, ms } = await post({ videoId: "TEST", segments: s, mode: "fast" });
-
-  assert.equal(res.status, 200, JSON.stringify(json));
-  assert.ok(Array.isArray(json.t), "t 가 배열이 아니다");
-  assert.equal(json.t.length, s.length, "I18 위반 — 길이가 다르다");
-  assert.equal(json.lines, undefined, "t 와 lines 가 동시에 왔다");
-  assert.ok(json.t.every((x) => typeof x === "string" && x.trim()), "빈 번역이 있다");
-  t.diagnostic(`fast N=8  ${ms}ms  ${usageOf(json)}`);
-});
-
-test("full 은 lines 를 주고 t 는 주지 않는다", { skip }, async (t) => {
-  const s = segs(12, `fulllen-${nonce}`);
-  const { res, json, ms } = await post({ videoId: "TEST", segments: s, mode: "full" });
+test("응답은 lines 이고 시간이 유효하다", { skip }, async (t) => {
+  const s = segs(12, `lines-${nonce}`);
+  const { res, json, ms } = await post({ videoId: "TEST", segments: s });
 
   assert.equal(res.status, 200, JSON.stringify(json));
   assert.ok(Array.isArray(json.lines) && json.lines.length, "lines 가 비었다");
-  assert.equal(json.t, undefined, "full 인데 t 가 왔다");
+  assert.equal(json.t, undefined, "t 는 더 이상 존재하지 않는다");
   for (const l of json.lines) {
     assert.equal(typeof l.start, "number");
     assert.equal(typeof l.end, "number");
     assert.ok(l.end >= l.start, `end < start: ${JSON.stringify(l)}`);
+    assert.ok(String(l.orig).trim(), "원문이 빈 줄이 있다");
   }
-  t.diagnostic(`full N=12 ${ms}ms  lines=${json.lines.length}  ${usageOf(json)}`);
+  t.diagnostic(`N=12 ${ms}ms  lines=${json.lines.length}  ${usageOf(json)}`);
 });
 
-test("W13 — 같은 조각이라도 mode 가 다르면 캐시가 분리된다", { skip }, async (t) => {
-  const s = segs(6, `cachesplit-${nonce}`);
+test("★ 응답이 요청 구간을 빠짐없이 덮는다 (mergeTranslated I5 의 전제)", { skip }, async (t) => {
+  const s = segs(12, `cover-${nonce}`);
+  const { json } = await post({ videoId: "COVER", segments: s });
 
-  const fast = await post({ videoId: "MODE", segments: s, mode: "fast" });
-  const full = await post({ videoId: "MODE", segments: s, mode: "full" });
+  assert.ok(Array.isArray(json.lines), JSON.stringify(json));
+  assert.equal(json.lines[0].start, s[0].start, "시작이 밀렸다");
+  assert.equal(json.lines.at(-1).end, s.at(-1).end, "끝이 밀렸다");
+  // 묶음은 연속이어야 한다 — 사이가 벌어지면 그 시각에 화면이 빈다
+  for (let i = 1; i < json.lines.length; i++) {
+    assert.ok(json.lines[i].start <= json.lines[i - 1].end + 1e-6,
+      `${i}번 줄 앞에 구멍: ${json.lines[i - 1].end} → ${json.lines[i].start}`);
+  }
+  t.diagnostic(`${s.length}조각 → ${json.lines.length}줄`);
+});
 
-  assert.ok(Array.isArray(fast.json.t), "fast 응답이 오염됐다");
-  assert.ok(Array.isArray(full.json.lines), "full 요청이 fast 캐시를 받았다");
-  assert.equal(full.json.t, undefined);
-  t.diagnostic(`fast ${fast.ms}ms / full ${full.ms}ms — 분리 확인`);
+test("★ 번역이 빈 줄이 없다 (W19 — 빈 줄은 영영 안 채워진다)", { skip }, async (t) => {
+  const s = segs(12, `empty-${nonce}`);
+  const { json } = await post({ videoId: "EMPTY2", segments: s });
+
+  const empty = (json.lines || []).filter((l) => !String(l.trans ?? "").trim());
+  assert.equal(empty.length, 0,
+    `빈 번역 ${empty.length}개: ${empty.map((l) => l.orig.slice(0, 40)).join(" | ")}`);
+  t.diagnostic(`${json.lines.length}줄 전부 번역됨`);
 });
 
 test("W2 — 두 번째 요청은 캐시 히트이고 결과가 같다", { skip }, async (t) => {
   const s = segs(6, `cachehit-${nonce}`);
-  const a = await post({ videoId: "CACHE", segments: s, mode: "fast" });
-  const b = await post({ videoId: "CACHE", segments: s, mode: "fast" });
+  const a = await post({ videoId: "CACHE", segments: s });
+  const b = await post({ videoId: "CACHE", segments: s });
 
   assert.equal(a.json.cached, false, "첫 요청이 이미 캐시됨 — nonce 가 안 먹었다");
   assert.equal(b.json.cached, true, "두 번째가 캐시 히트가 아니다");
-  assert.deepEqual(b.json.t, a.json.t, "캐시 결과가 원본과 다르다");
+  assert.deepEqual(b.json.lines, a.json.lines, "캐시 결과가 원본과 다르다");
   t.diagnostic(`미스 ${a.ms}ms → 히트 ${b.ms}ms`);
-});
-
-test("W15 — fast 는 빈 조각이 섞이면 거절한다", { skip }, async () => {
-  const s = segs(4, `empty-${nonce}`);
-  s[2].text = "   ";
-  const { res, json } = await post({ videoId: "EMPTY", segments: s, mode: "fast" });
-
-  assert.equal(res.status, 400, `거절하지 않았다: ${JSON.stringify(json)}`);
 });
 
 test("잘못된 요청은 400 이다", { skip }, async () => {

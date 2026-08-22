@@ -1,16 +1,11 @@
-/* fast / full 번역 등급 벤치마크 — 실제 워커 + 실제 LLM 을 때린다.
+/* 번역 지연 벤치마크 — 실제 워커 + 실제 LLM 을 때린다.
  *
  * 왜 필요한가:
- *   코드에 박힌 근거(content.js:917-918 "terra 9.7초 / 2.7초")는
- *     - test/worker.test.js:40 의 합성 텍스트로 쟀다 (문장이 완결돼 있고 12줄이 거의
- *       동일하다. full 의 MERGE 단계가 할 일이 없는 입력이다)
- *     - N 이 어긋나 있다 (fast 8 vs full 12). 등급 효과와 크기 효과가 섞였다
- *     - 표본이 1개다
- *   그래서 "fast 가 실제로 빠른가"에 답하지 못한다. 여기서는 실제 fixture 조각을
- *   같은 N 으로 양쪽에 보내 등급 효과만 분리한다.
+ *   test/worker.test.js 의 합성 텍스트(반복 문장)로 재면 절대값이 2배 이상
+ *   낙관적으로 나온다. 여기서는 실제 fixture 조각을 그대로 보낸다.
  *
  * 이것은 테스트가 아니라 측정이다. 지연은 분산이 커서 단정하면 flaky 해진다.
- * 비flaky 한 계약(길이·reasoning·커버리지)만 나중에 test/worker.test.js 로 승격한다.
+ * 비flaky 한 계약(커버리지·빈 번역 없음)은 test/worker.test.js 에 있다.
  *
  * 사용법:
  *   npm run dev                       # 터미널 1 (wrangler, :8787)
@@ -37,12 +32,10 @@ const FIXTURES = [
   { id: "D8A2q3awnsU", kind: "자동", lang: "ja" },
 ];
 
-/* 세 셀은 같은 i0 를 공유한다. A/B 는 입력이 완전히 동일해 등급 효과만 남고,
- * C 는 같은 시작점의 상위집합이라 크기 효과를 읽을 수 있다. */
+/* 두 셀은 같은 i0 를 공유한다. C 는 B 의 상위집합이라 크기 효과를 읽을 수 있다. */
 const CELLS = [
-  { id: "A", mode: "fast", n: 8, label: "fast N=8" },
-  { id: "B", mode: "full", n: 8, label: "full N=8" },
-  { id: "C", mode: "full", n: 12, label: "full N=12" },
+  { id: "B", n: 8, label: "N=8" },
+  { id: "C", n: 12, label: "N=12" },
 ];
 
 const CTX_N = 8;          // content.js 와 동일
@@ -85,7 +78,6 @@ function buildBody(fx, i0, cell) {
     segments,
     ctxBefore: fx.segments.slice(Math.max(0, i0 - CTX_N), i0).map((s) => s.text),
     ctxAfter: fx.segments.slice(i0 + cell.n, i0 + cell.n + CTX_N).map((s) => s.text),
-    mode: cell.mode,
   };
 }
 
@@ -119,16 +111,7 @@ function measure(cell, segments, json) {
     violations: [],
   };
 
-  if (cell.mode === "fast") {
-    const t = json.t;
-    if (!Array.isArray(t)) rec.violations.push("t 가 배열이 아님");
-    else {
-      if (t.length !== segments.length) rec.violations.push(`I18 길이 ${t.length}/${segments.length}`);
-      rec.emptyTrans = t.filter((x) => !String(x).trim()).length;
-      rec.samples = segments.slice(0, 2).map((s, i) => ({ orig: s.text, trans: t[i] ?? "" }));
-    }
-    if (json.lines !== undefined) rec.violations.push("fast 인데 lines 가 왔다");
-  } else {
+  {
     const lines = json.lines;
     if (!Array.isArray(lines) || !lines.length) rec.violations.push("lines 가 비었음");
     else {
@@ -142,7 +125,7 @@ function measure(cell, segments, json) {
       if (rec.maxOrig > MAX_LINE_CHARS) rec.violations.push(`W4 최장 ${rec.maxOrig}자`);
 
       // ★ 번역이 빈 줄. mergeTranslated 가 tier:"full" 로 도장을 찍으므로 I21 에 의해
-      //   applyFast 가 영영 못 채운다 — 화면에 원문만 남는 영구 결함이다.
+      //   분할된 형태로 KV 에 저장되므로 새로고침해도 같다 — 화면에 원문만 남는다.
       //   원인이 둘이라 구분해서 센다:
       //     (a) LLM 이 t 를 비워 보냄        → 이웃과 시간이 안 겹치는 단독 빈 줄
       //     (b) splitLine/packToK 의 꼬리 유실 → 앞줄이 시간상 이어지고 번역이 있는 경우
@@ -158,13 +141,12 @@ function measure(cell, segments, json) {
       const mid = Math.max(0, (lines.length >> 1) - 1);
       rec.samples = lines.slice(mid, mid + 2).map((l) => ({ orig: l.orig, trans: l.trans }));
     }
-    if (json.t !== undefined) rec.violations.push("full 인데 t 가 왔다");
   }
   return rec;
 }
 
 async function main() {
-  console.log(`# fast/full 번역 벤치마크  run=${runId}`);
+  console.log(`# 번역 벤치마크  run=${runId}`);
   console.log(`  worker=${BASE}  target=${TARGET}\n`);
 
   // ── 사전 점검 ──────────────────────────────────────────────────────
@@ -180,12 +162,12 @@ async function main() {
 
   // 카나리아 — 36요청을 낭비하기 전에 워커·상류(CLIProxyAPI) 경로를 확인한다.
   // 워밍업도 겸한다 (첫 요청의 연결 수립 비용이 A 셀에만 실리면 비교가 왜곡된다).
-  process.stdout.write("\n카나리아(fast N=2) … ");
+  process.stdout.write("\n카나리아(N=2) … ");
   const canary = await post({
     videoId: `bench-${runId}-canary`, lang: "en", target: TARGET,
-    segments: fixtures[0].segments.slice(0, 2), mode: "fast",
+    segments: fixtures[0].segments.slice(0, 2),
   }, 120_000);
-  if (!canary.ok || !Array.isArray(canary.json.t)) {
+  if (!canary.ok || !Array.isArray(canary.json.lines)) {
     console.log("실패");
     console.error(`  status=${canary.status} ${JSON.stringify(canary.json).slice(0, 300)}`);
     console.error("  → 워커(:8787) 와 CLIProxyAPI(:8317) 상태를 확인하세요. 중단합니다.");
@@ -220,7 +202,7 @@ async function main() {
           ? { ...measure(cell, body.segments, json), ms }
           : { ms, error: `${status} ${String(json.error).slice(0, 120)}`, violations: [] };
 
-        results.push({ fixture: fx.id, kind: fx.kind, lang: fx.lang, i0, cell: cell.id, mode: cell.mode, n: cell.n, ...rec });
+        results.push({ fixture: fx.id, kind: fx.kind, lang: fx.lang, i0, cell: cell.id, n: cell.n, ...rec });
 
         const mark = rec.error ? "✗" : rec.violations.length ? "!" : "·";
         process.stdout.write(
@@ -236,41 +218,39 @@ async function main() {
   // ── 집계 ───────────────────────────────────────────────────────────
   const clean = (rows) => rows.filter((r) => !r.error && !r.degraded);
 
-  console.log("① 등급 효과 — 같은 입력(N=8)에 mode 만 다르게");
+  console.log("① 크기별 지연");
   console.log(`  ${pad("종류", 6)} ${pad("셀", 11)} ${padL("n", 3)} ${padL("중앙ms", 8)} ${padL("최소", 7)} ${padL("최대", 7)} ${padL("out토큰", 8)} ${padL("reason", 7)} ${padL("degr", 5)}`);
   for (const kind of ["수동", "자동"]) {
-    for (const cell of ACTIVE.filter((c) => c.n === 8)) {
+    for (const cell of ACTIVE) {
       const rows = results.filter((r) => r.kind === kind && r.cell === cell.id);
       const c = clean(rows);
       console.log(`  ${pad(kind, 6)} ${pad(cell.label, 11)} ${padL(c.length, 3)} ${padL(median(c.map((r) => r.ms)) ?? "-", 8)} ${padL(Math.min(...c.map((r) => r.ms)) || "-", 7)} ${padL(Math.max(...c.map((r) => r.ms)) || "-", 7)} ${padL(median(c.map((r) => r.outTokens).filter((x) => x != null)) ?? "-", 8)} ${padL(median(c.map((r) => r.reasoning).filter((x) => x != null)) ?? "-", 7)} ${padL(rows.filter((r) => r.degraded).length, 5)}`);
     }
   }
 
-  console.log("\n② 크기 효과 — full N=8 vs N=12");
+  console.log("\n② 크기 효과 — N=8 vs N=12");
   console.log(`  ${pad("종류", 6)} ${pad("셀", 11)} ${padL("n", 3)} ${padL("중앙ms", 8)} ${padL("out토큰", 8)} ${padL("reason", 7)}`);
   for (const kind of ["수동", "자동"]) {
-    for (const cell of ACTIVE.filter((c) => c.mode === "full")) {
+    for (const cell of ACTIVE) {
       const c = clean(results.filter((r) => r.kind === kind && r.cell === cell.id));
       console.log(`  ${pad(kind, 6)} ${pad(cell.label, 11)} ${padL(c.length, 3)} ${padL(median(c.map((r) => r.ms)) ?? "-", 8)} ${padL(median(c.map((r) => r.outTokens).filter((x) => x != null)) ?? "-", 8)} ${padL(median(c.map((r) => r.reasoning).filter((x) => x != null)) ?? "-", 7)}`);
     }
   }
 
-  console.log("\n③ full 조각 커버리지 — 반환 줄이 입력 구간을 덮는가 (mergeTranslated I5 의 전제)");
+  console.log("\n③ 조각 커버리지 — 반환 줄이 입력 구간을 덮는가 (mergeTranslated I5 의 전제)");
   console.log(`  ${pad("fixture", 13)} ${pad("셀", 11)} ${padL("요청", 5)} ${padL("구멍발생", 9)} ${padL("구멍초", 8)} ${padL("최장줄", 7)} ${padL("줄수중앙", 9)}`);
   for (const fx of fixtures) {
-    for (const cell of ACTIVE.filter((c) => c.mode === "full")) {
+    for (const cell of ACTIVE) {
       const rows = results.filter((r) => r.fixture === fx.id && r.cell === cell.id && !r.error);
       if (!rows.length) continue;
       console.log(`  ${pad(fx.id, 13)} ${pad(cell.label, 11)} ${padL(rows.length, 5)} ${padL(rows.filter((r) => r.holes > 0).length, 9)} ${padL(rows.reduce((n, r) => n + (r.holeSec || 0), 0).toFixed(2), 8)} ${padL(Math.max(...rows.map((r) => r.maxOrig || 0)), 7)} ${padL(median(rows.map((r) => r.lineCount).filter((x) => x != null)) ?? "-", 9)}`);
     }
   }
 
-  const fastRows = results.filter((r) => r.mode === "fast" && !r.error);
-  console.log(`\n  fast 길이 계약(I18) 위반 ${fastRows.filter((r) => r.violations.some((v) => v.startsWith("I18"))).length}/${fastRows.length},  빈 번역 총 ${fastRows.reduce((n, r) => n + (r.emptyTrans || 0), 0)}개`);
 
-  console.log("\n③-2 full 빈 번역 — mergeTranslated 가 tier:\"full\" 로 찍으면 I21 때문에 영영 안 채워진다");
+  console.log("\n③-2 빈 번역 — mergeTranslated 가 tier:\"full\" 로 찍으면 I21 때문에 영영 안 채워진다");
   console.log(`  ${pad("셀", 11)} ${padL("요청", 5)} ${padL("빈줄있는요청", 13)} ${padL("빈줄", 6)} ${padL("전체줄", 7)} ${padL("비율", 7)} ${padL("꼬리유실", 9)} ${padL("단독", 5)}`);
-  for (const cell of ACTIVE.filter((c) => c.mode === "full")) {
+  for (const cell of ACTIVE) {
     const rows = results.filter((r) => r.cell === cell.id && !r.error && r.lineCount);
     if (!rows.length) continue;
     const empty = rows.reduce((n, r) => n + (r.emptyTrans || 0), 0);
@@ -288,7 +268,7 @@ async function main() {
     }
   }
 
-  console.log("\n④ 샘플 — 자동 자막에서 fast 조각 번역이 뜻이 통하는가");
+  console.log("\n④ 샘플 — 번역이 뜻이 통하는가");
   for (const fx of fixtures) {
     console.log(`\n  ── ${fx.id} (${fx.kind} ${fx.lang}) ──`);
     for (const cell of ACTIVE) {

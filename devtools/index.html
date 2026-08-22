@@ -42,53 +42,27 @@
     <div class="stat-grid" id="norm-stats"></div>
   </section>
 
-  <!-- ── 창 선택 ────────────────────────────────────────────── -->
-  <section class="panel" id="panel-window">
-    <h2>2 · fast 창이 무엇을 고르는가</h2>
-    <p class="hint">
-      옛 코드는 청크 머리 8조각을 고정으로 썼다. 재생 지점이 청크 중간이면
-      이미 지나간 구간을 번역한다. 아래에서 두 방식이 고르는 조각을 비교한다.
-    </p>
-    <div class="wincmp">
-      <div>
-        <h3>옛 방식 <span class="tag bad">c.segs.slice(0,8)</span></h3>
-        <div class="segs" id="win-old"></div>
-        <div class="winstat" id="winstat-old"></div>
-      </div>
-      <div>
-        <h3>현재 <span class="tag good">fastWindow()</span></h3>
-        <div class="segs" id="win-new"></div>
-        <div class="winstat" id="winstat-new"></div>
-      </div>
-    </div>
-  </section>
-
-  <!-- ── 경주 ───────────────────────────────────────────────── -->
+  <!-- ── 실행 ───────────────────────────────────────────────── -->
   <section class="panel" id="panel-race">
-    <h2>3 · fast vs full 실행</h2>
+    <h2>2 · 번역 실행</h2>
     <div class="controls">
-      <button id="run" class="primary">이 지점에서 실행</button>
-      <button id="run-full-grid">full 격자 전체 번역</button>
+      <button id="run" class="primary">이 지점 청크 번역</button>
+      <button id="run-full-grid">전체 번역</button>
       <button id="clear">기록 지우기</button>
       <label class="inline"><input type="checkbox" id="bust" checked> 캐시 우회</label>
     </div>
 
     <div class="race">
-      <div class="lane" id="lane-fast">
-        <h3>fast <span class="n">N=8</span></h3>
-        <div class="timer" id="timer-fast">—</div>
-        <div class="lane-meta" id="meta-fast"></div>
-      </div>
-      <div class="lane" id="lane-full">
-        <h3>full <span class="n">N=12</span></h3>
-        <div class="timer" id="timer-full">—</div>
-        <div class="lane-meta" id="meta-full"></div>
+      <div class="lane" id="lane-one">
+        <h3>이 청크 <span class="n">N=12</span></h3>
+        <div class="timer" id="timer-one">—</div>
+        <div class="lane-meta" id="meta-one"></div>
       </div>
     </div>
 
     <table class="runs" id="runs">
       <thead><tr>
-        <th>#</th><th>자막</th><th>등급</th><th>N</th><th>ms</th>
+        <th>#</th><th>자막</th><th>N</th><th>ms</th>
         <th>출력토큰</th><th>reasoning</th><th>빈번역</th><th>구멍</th><th>최장줄</th>
       </tr></thead>
       <tbody></tbody>
@@ -98,14 +72,14 @@
 
   <!-- ── 결과 ───────────────────────────────────────────────── -->
   <section class="panel" id="panel-lines">
-    <h2>4 · 번역 결과</h2>
+    <h2>3 · 번역 결과</h2>
     <div class="hint" id="lines-hint">아직 실행하지 않았습니다.</div>
     <div class="lines" id="lines"></div>
   </section>
 
   <!-- ── 오버레이 ───────────────────────────────────────────── -->
   <section class="panel" id="panel-preview">
-    <h2>5 · 자막 오버레이 미리보기</h2>
+    <h2>4 · 자막 오버레이 미리보기</h2>
     <p class="hint">
       실제 overlay.css 와 실제 findLine() 으로 그린다. 슬라이더를 끌면 그 시각에
       화면에 뜨는 자막이 그대로 보인다 — 비는 순간이 있으면 여기서 드러난다.
