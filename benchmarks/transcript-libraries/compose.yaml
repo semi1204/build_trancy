@@ -1,0 +1,27 @@
+name: ytdual-transcript-libraries
+
+services:
+  jdepoix:
+    build:
+      context: ./jdepoix-youtube-transcript-api
+    stdin_open: true
+
+  kakulukian:
+    build:
+      context: ./kakulukian-youtube-transcript
+    stdin_open: true
+
+  ericmmartin:
+    build:
+      context: ./ericmmartin-youtube-transcript-plus
+    stdin_open: true
+
+  trldvix:
+    build:
+      context: ./trldvix-youtube-transcript-api
+    stdin_open: true
+
+  yt-dlp:
+    build:
+      context: ./yt-dlp
+    stdin_open: true

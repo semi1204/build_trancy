@@ -12,8 +12,10 @@
     "fixture:transcript": "node scripts/capture-youtube-fixture.mjs --transcript-only",
     "fixture:check": "node scripts/verify-youtube-fixture.mjs",
     "bench": "node scripts/bench-translation.mjs",
+    "bench:transcript": "node scripts/bench-transcript-libraries.mjs",
+    "bench:transcript:smoke": "node scripts/bench-transcript-libraries.mjs --smoke",
     "harness": "node scripts/dev-server.mjs",
-    "check": "node --check ytdual/extension/content.js && node --check ytdual/extension/ytpage.js && node --check ytdual/worker/src/index.js && node --check scripts/capture-youtube-fixture.mjs && node --check scripts/verify-youtube-fixture.mjs",
+    "check": "node --check ytdual/extension/content.js && node --check ytdual/extension/ytpage.js && node --check ytdual/worker/src/index.js && node --check scripts/capture-youtube-fixture.mjs && node --check scripts/verify-youtube-fixture.mjs && node --check scripts/bench-transcript-libraries.mjs",
     "dev": "wrangler dev --config ytdual/worker/wrangler.toml --port 8787"
   }
 }

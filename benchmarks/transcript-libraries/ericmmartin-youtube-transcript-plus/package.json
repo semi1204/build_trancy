@@ -1,0 +1,9 @@
+{
+  "name": "ytdual-bench-ericmmartin",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "youtube-transcript-plus": "2.0.1"
+  }
+}

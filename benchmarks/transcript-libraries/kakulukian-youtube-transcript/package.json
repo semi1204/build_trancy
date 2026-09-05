@@ -1,0 +1,9 @@
+{
+  "name": "ytdual-bench-kakulukian",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "youtube-transcript": "1.3.1"
+  }
+}
